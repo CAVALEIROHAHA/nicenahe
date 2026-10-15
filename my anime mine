@@ -599,7 +599,6 @@ function MineProgression.UpgradeTeamOnce()
     if not active() or not FarmState.AutoUpgradeMiners or not GameState then return false end
     local ranked, money = getRankedMiners()
     local focus = MineProgression.ShouldFocusTeam()
-    if FarmState.MasterAFK and not focus then return false end
     local stats = focus and {{"Damage","dmgLvl","maxDmgLvl","dmgCost"}} or {
         {"Damage","dmgLvl","maxDmgLvl","dmgCost"},
         {"Speed","spdLvl","maxSpdLvl","spdCost"},
@@ -7236,7 +7235,7 @@ local function setMaster(value)
 end
 ToggleControls.MasterAFK = secMaster:Toggle({
     Title = "Master AFK - One Click",
-    Desc = "Enable all progression with Strict Best First off. Upgrade team Damage only when Skill Tree needs more power, then focus on other progression.",
+    Desc = "Enable all progression with Strict Best First off. Upgrade miners normally; prioritize team Damage and reserve funds when Skill Tree needs more power.",
     Value = false, Callback = setMaster,
 })
 ToggleControls.MasterSellDelay = secMaster:Slider({
