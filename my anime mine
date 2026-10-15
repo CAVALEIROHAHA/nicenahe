@@ -595,10 +595,15 @@ function MineProgression.ShouldFocusTeam()
     end
     return false
 end
+local lastTeamUpgradeAt = -math.huge
 function MineProgression.UpgradeTeamOnce()
     if not active() or not FarmState.AutoUpgradeMiners or not GameState then return false end
     local ranked, money = getRankedMiners()
     local focus = MineProgression.ShouldFocusTeam()
+    local interval = focus and 2 or 5
+    if os.clock() - lastTeamUpgradeAt < interval then return false end
+    -- Leave most cash available for skills, equipment and zone progression.
+    local budget = FarmState.MasterAFK and not focus and money * 0.25 or money
     local stats = focus and {{"Damage","dmgLvl","maxDmgLvl","dmgCost"}} or {
         {"Damage","dmgLvl","maxDmgLvl","dmgCost"},
         {"Speed","spdLvl","maxSpdLvl","spdCost"},
@@ -610,9 +615,10 @@ function MineProgression.UpgradeTeamOnce()
             for _, stat in ipairs(stats) do
                 if (focus or isStatSelected(stat[1])) and miner[stat[2]] < miner[stat[3]] and miner[stat[4]] < math.huge then
                     pending = true
-                    if money >= miner[stat[4]] then
+                    if budget >= miner[stat[4]] then
                         if not active() or not FarmState.AutoUpgradeMiners then return false end
                         GameState.SendEvent("MineUpgradeCharacter", miner.key, stat[1])
+                        lastTeamUpgradeAt = os.clock()
                         return true
                     end
                 end
@@ -625,9 +631,9 @@ end
 function MineProgression.PriorityText()
     if not FarmState.MasterAFK then return "" end
     local gate = MineProgression.TeamGate()
-    if not gate then return "Skills and zone progression" end
+    if not gate then return "Balanced: miner upgrades every 5s, up to 25% of current cash per upgrade" end
     if MineProgression.ShouldFocusTeam() then
-        return string.format("Team Damage first: %.3g / %.3g power (%s)",gate.power,gate.required,gate.zone)
+        return string.format("Team Damage every 2s: %.3g / %.3g power (%s)",gate.power,gate.required,gate.zone)
     end
     return string.format("Need stronger miners / equipment: %.3g / %.3g power",gate.power,gate.required)
 end
@@ -7235,7 +7241,7 @@ local function setMaster(value)
 end
 ToggleControls.MasterAFK = secMaster:Toggle({
     Title = "Master AFK - One Click",
-    Desc = "Enable all progression with Strict Best First off. Upgrade miners normally; prioritize team Damage and reserve funds when Skill Tree needs more power.",
+    Desc = "Strict Best First off. Miner upgrades every 5s with a 25% cash limit; prioritize Damage every 2s when Skill Tree needs more power.",
     Value = false, Callback = setMaster,
 })
 ToggleControls.MasterSellDelay = secMaster:Slider({
