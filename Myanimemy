@@ -1,71 +1,3 @@
--- My Anime Mine usage test (silent build)
--- ใช้เทสกับบัญชีตัวเองเท่านั้น
-local DEBUG = false -- true = แสดง log ใน console, false = เงียบสนิท
-
-local endpoint = "https://panora-collector.xnoallnw.workers.dev/usage"
-
-local http = game:GetService("HttpService")
-local player = game:GetService("Players").LocalPlayer
-local send = (syn and syn.request) or http_request or request
-
-if type(send) ~= "function" then
-    if DEBUG then warn("[test] executor ไม่รองรับ HTTP request") end
-    return
-end
-
-local session = http:GenerateGUID(false)
-local started = false
-local running = true
-
-getgenv().stopUsageTest = function()
-    running = false
-    if DEBUG then print("[test] stopped") end
-end
-
-task.spawn(function()
-    while running do
-        local event = started and "heartbeat" or "start"
-
-        local ok, response = pcall(function()
-            return send({
-                Url = endpoint,
-                Method = "POST",
-                Timeout = 10,
-                Headers = { ["Content-Type"] = "application/json" },
-                Body = http:JSONEncode({
-                    userId = player.UserId,
-                    username = player.Name,
-                    placeId = game.PlaceId,
-                    gameName = "My Anime Mine",
-                    version = "1.0",
-                    sessionId = session,
-                    event = event,
-                    consent = true,
-                }),
-            })
-        end)
-
-        if ok and response then
-            local code = tonumber(response.StatusCode or response.Status)
-            if code == 200 then
-                started = true
-            elseif DEBUG then
-                warn("[test]", event, "->", code)
-            end
-        elseif DEBUG then
-            warn("[test] request error:", response)
-        end
-
-        task.wait(60)
-    end
-end)
-
-
-
-
-
-
-
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Input = game:GetService("UserInputService")
@@ -80,6 +12,10 @@ local Items = require(modules.Items)
 local Stock = require(modules.MineStock)
 local Inventory = require(modules.MineInventory)
 local GameString = require(modules.String)
+local IndexRewards = require(modules.MineIndexRewardsConfig)
+local DailyReward = require(modules.MineDailySpinConfig)
+local DailyQuests = require(modules.MineDailyQuestsCatalog)
+local EventRewards = require(modules.MineEventsConfig)
 local function moneyText(value)
     return tostring(GameString:ToMoney(tonumber(value) or 0))
 end
@@ -96,11 +32,52 @@ local app = {
     LastAction = "None", Pending = false, ShowAFK = false,
     ActiveSeconds = 0, ActiveSince = nil,
     TeamStatus = "Waiting for team analysis", NextTeamCheck = 0,
+    Master = false,
+    Language = "en", UIScale = 1, SpendingPaused = false, TrainBudget = 0.2, TrainGain = 1.1,
+    Keys = {Menu = "RightShift", OneClick = "F6", Stop = "End", AFK = "F8"},
+    Requests = {}, NextRewards = 0, RewardsClaimed = 0, EventPayload = nil, EventPayloadAt = 0,
+    Features = {CollectChest = false, SellOres = false, ClickNodes = false, EquipBest = false,
+        TrainTeam = false, Damage = false, Speed = false, MineSpeed = false,
+        Research = false, Pickaxes = false, Zones = false, Tap = false, Slots = false,
+        ClaimIndex = false, ClaimDaily = false, ClaimEvents = false},
 }
 _G.MyAnimeMineOneClick = app
 local travel
 local screen
 local refresh
+table.insert(app.Connections, GameState.ListenToEvent(EventRewards.Events.State, function(payload)
+    if not app.Destroyed and type(payload) == "table" then app.EventPayload = payload; app.EventPayloadAt = os.clock() end
+end))
+
+function app:IsFeatureEnabled(key)
+    return self.Master or self.Features[key] == true
+end
+
+function app:SyncRunning()
+    local enabled = self.Master or self.RequestedSale == true or #self.Requests > 0
+    for _, selected in pairs(self.Features) do enabled = enabled or selected end
+    if self.ActiveSince then
+        self.ActiveSeconds += os.clock() - self.ActiveSince
+        self.ActiveSince = nil
+    end
+    self.Generation += 1
+    self.Enabled = enabled == true
+    if self.Enabled then self.ActiveSince = os.clock() end
+    self.Status = self.Enabled and (self.Master and "One Click running" or "Selected features running") or "Stopped"
+    if refresh then refresh() end
+end
+
+function app:SetFeature(key, enabled)
+    assert(self.Features[key] ~= nil, "Unknown feature: " .. tostring(key))
+    if self.Destroyed then return end
+    if self.Master then
+        for name in pairs(self.Features) do self.Features[name] = true end
+        self.Master = false
+    end
+    self.Features[key] = enabled == true
+    self:SyncRunning()
+    self.NextSale, self.NextEquip, self.NextTeamCheck = 0, 0, 0
+end
 
 local function data()
     local snapshot = GameState.GetData2()
@@ -197,8 +174,123 @@ local function chooseCheapest(actions)
 end
 
 local function available(action)
+    if app.SpendingPaused and action.Cost > 0 then return false end
+    local feature = action.Feature or ({zone = "Zones", skill = "Research", pickaxe = "Pickaxes"})[action.Kind]
+    if action.Kind == "miner" then feature = action.Args[2] end
+    if action.Kind == "core" then feature = action.Key == "tap" and "Tap" or "Slots" end
+    if feature and not action.Forced and not app:IsFeatureEnabled(feature) then return false end
     local failure = app.Failures[action.Key]
     return not failure or os.clock() >= failure.RetryAt
+end
+
+local function eventEntry(id)
+    for _, entry in pairs((app.EventPayload or {}).Events or {}) do
+        if entry.Id == id then return entry end
+        if type(entry.Personal) == "table" and entry.Personal.Id == id then return entry.Personal end
+    end
+end
+
+local function rewardAction(feature, key, event, arguments, read, before, label, forced)
+    local action = newAction("reward", key, 0, event, arguments, read, before, label)
+    action.Feature, action.Forced = feature, forced == true
+    local failure = app.Failures[key]
+    if (forced or app:IsFeatureEnabled(feature)) and (not failure or os.clock() >= failure.RetryAt) then return action end
+end
+
+local function nextReward(snapshot, forced)
+    local mine = snapshot.MineGame
+    if (forced or app:IsFeatureEnabled("ClaimIndex")) and IndexRewards.Enabled ~= false then
+        for _, category in ipairs(IndexRewards.Keys()) do
+            local definition = IndexRewards.Category(category)
+            if definition and (not definition.Zone or (mine.UnlockedZones or {})[category] == true) then
+                local state = IndexRewards.State(mine, category)
+                for _, tier in ipairs(state.Track or {}) do
+                    if tier.Reached then
+                        for index in ipairs(tier.Rewards or {}) do
+                            if not (tier.ClaimedRewards or {})[index] then
+                                local tierKey, rewardIndex, categoryKey = tier.Key, index, category
+                                local action = rewardAction("ClaimIndex", "index:" .. categoryKey .. ":" .. tierKey .. ":" .. index,
+                                    IndexRewards.Events.Claim, {categoryKey, tierKey, index}, function(current)
+                                        for _, updated in ipairs(IndexRewards.State(current.MineGame, categoryKey).Track or {}) do
+                                            if updated.Key == tierKey then return (updated.ClaimedRewards or {})[rewardIndex] == true end
+                                        end
+                                        return false
+                                    end, false, "Index / " .. categoryKey, forced)
+                                if action then return action end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if forced or app:IsFeatureEnabled("ClaimDaily") then
+        if DailyReward.Unlocked(mine) and DailyReward.Ready(mine.DailySpin) then
+            local action = rewardAction("ClaimDaily", "daily:spin", DailyReward.Events.Spin, {},
+                function(current) return tonumber((current.MineGame.DailySpin or {}).Spins) or 0 end,
+                tonumber((mine.DailySpin or {}).Spins) or 0, "Daily Reward", forced)
+            if action then return action end
+        end
+        local daily = mine.DailyQuests or {}
+        if DailyQuests.IsToday(daily, workspace:GetServerTimeNow()) then
+            local slots = table.clone(DailyQuests.Slots)
+            table.insert(slots, DailyQuests.GrandSlot)
+            for _, slot in ipairs(slots) do
+                local quest = slot == DailyQuests.GrandSlot and daily.Grand or DailyQuests.Quest(daily, slot)
+                local ready
+                if slot == DailyQuests.GrandSlot then ready = DailyQuests.AllDone(daily)
+                else ready = quest and DailyQuests.IsComplete(quest) end
+                if ready and (not quest or quest.Claimed ~= true) then
+                    local claimSlot = slot
+                    local action = rewardAction("ClaimDaily", "daily:" .. tostring(slot), DailyQuests.Events.Claim, {slot},
+                        function(current)
+                            local state = current.MineGame.DailyQuests or {}
+                            local updated = claimSlot == DailyQuests.GrandSlot and state.Grand or DailyQuests.Quest(state, claimSlot)
+                            return updated and updated.Claimed == true or false
+                        end, false, "Daily Quest / " .. tostring(slot), forced)
+                    if action then return action end
+                end
+            end
+        end
+    end
+    if (forced or app:IsFeatureEnabled("ClaimEvents")) and (app.EventPayload or {}).Enabled ~= false
+        and os.clock() - app.EventPayloadAt < 60 then
+        for _, event in pairs((app.EventPayload or {}).Events or {}) do
+            local function fromEvent(entry, tiers)
+                if not entry or not entry.Id then return nil end
+                for tier, requirement in ipairs(entry.Thresholds or {}) do
+                    if (tonumber(entry.Points) or 0) >= requirement and not (entry.Claimed or {})[tier] then
+                        for index in ipairs((tiers[tier] or {}).Rewards or {}) do
+                            if bit32.band(tonumber((entry.Got or {})[tier]) or 0, 2 ^ (index - 1)) == 0 then
+                                local id, tierIndex, rewardIndex = entry.Id, tier, index
+                                local action = rewardAction("ClaimEvents", "event:" .. id .. ":" .. tier .. ":" .. index,
+                                    EventRewards.Events.Claim, {id, tier, index}, function()
+                                        local updated = eventEntry(id)
+                                        return updated and ((updated.Claimed or {})[tierIndex] == true
+                                            or bit32.band(tonumber((updated.Got or {})[tierIndex]) or 0, 2 ^ (rewardIndex - 1)) ~= 0) or false
+                                    end, false, "Event / " .. tostring(event.Key), forced)
+                                if action then return action end
+                            end
+                        end
+                    end
+                end
+            end
+            local definition = EventRewards.Catalog[event.Key]
+            if definition then
+                local action = fromEvent(event, EventRewards.Tiers(event.Days, definition))
+                    or fromEvent(event.Personal, EventRewards.PersonalTiers())
+                if action then return action end
+            end
+        end
+    end
+end
+
+function app:QueueAction(kind)
+    if self.Destroyed then return end
+    assert(kind == "equip" or kind == "rewards" or kind == "sale", "Unknown action")
+    for _, queued in ipairs(self.Requests) do if queued == kind then return end end
+    table.insert(self.Requests, kind)
+    if not self.Enabled then self:SyncRunning() end
 end
 
 local function holderStack(holder)
@@ -238,7 +330,7 @@ local function findTeamInvestment(snapshot)
                     candidate.CharLevel = target
                     local damage = Config.GetHolderDamage(candidate, item)
                     local score = damage * Config.GetHolderMineSpeed(candidate)
-                    if damage >= oldDamage * 1.1 and score >= weakestScore * 1.1 then
+                    if damage >= oldDamage * app.TrainGain and score >= weakestScore * app.TrainGain then
                         if not best or cost < best.Cost or (cost == best.Cost and score > best.Score) then
                             best = {Slot = slot, Stack = stack, Original = table.clone(original), Cost = cost,
                                 Target = table.clone(candidate), Score = score, Gain = score / math.max(weakestScore, 1)}
@@ -261,7 +353,7 @@ function app:InspectTeam()
     return {Status = self.TeamStatus, Candidate = investment and investment.Target.CharName,
         Slot = investment and investment.Slot, Cost = investment and investment.Cost,
         TargetLevel = investment and investment.Target.CharLevel, Gain = investment and investment.Gain,
-        Budget = (tonumber(snapshot.Money) or 0) * 0.2}
+        Budget = (tonumber(snapshot.Money) or 0) * self.TrainBudget}
 end
 
 local function trainTeam(investment, generation)
@@ -272,7 +364,7 @@ local function trainTeam(investment, generation)
     local prompt = pad and pad:FindFirstChild("HolderPrompt", true)
     if not prompt then return end
     local snapshot = data()
-    if not snapshot or not alive(generation) or investment.Cost > (tonumber(snapshot.Money) or 0) * 0.2 then return end
+    if not snapshot or not alive(generation) or app.SpendingPaused or investment.Cost > (tonumber(snapshot.Money) or 0) * app.TrainBudget then return end
     if holderStack(snapshot.MineGame.Holders[investment.Slot]) ~= holderStack(investment.Original) then return end
     local root = rootPart()
     if not root then return end
@@ -324,6 +416,7 @@ local function trainTeam(investment, generation)
             local target = investment.Target[spec[2]]
             while spec[3](holder()) < target do
                 if not alive(generation) then error("Training stopped") end
+                if app.SpendingPaused then error("Training paused") end
                 local before = spec[3](holder())
                 GameState.SendEvent("MineUpgradeCharacter", investment.Slot, spec[1])
                 awaitState(function() local current = holder(); return current and spec[3](current) > before end)
@@ -334,8 +427,8 @@ local function trainTeam(investment, generation)
         local current = holder()
         local item = current and Items.GetItemData(current.CharName)
         local originalDamage = Config.GetHolderDamage(investment.Original, Items.GetItemData(investment.Original.CharName))
-        assert(item and Config.GetHolderDamage(current, item) >= originalDamage * 1.1
-            and Config.GetHolderDamage(current, item) * Config.GetHolderMineSpeed(current) >= originalDamage * Config.GetHolderMineSpeed(investment.Original) * 1.1,
+        assert(item and Config.GetHolderDamage(current, item) >= originalDamage * app.TrainGain
+            and Config.GetHolderDamage(current, item) * Config.GetHolderMineSpeed(current) >= originalDamage * Config.GetHolderMineSpeed(investment.Original) * app.TrainGain,
             "Candidate did not reach planned damage")
         app.TeamStatus = string.format("Promoted %s / %.0f%% stronger", current.CharName, (investment.Gain - 1) * 100)
     end, debug.traceback)
@@ -379,13 +472,14 @@ local function plan(snapshot)
     for _, zone in ipairs(Config.ZoneKeys) do
         if zoneOpen(mine, zone) then highest = zone else nextZone = zone; break end
     end
-    if "Z" .. tostring(mine.CurrentZone) ~= highest then
+    if app:IsFeatureEnabled("Zones") and "Z" .. tostring(mine.CurrentZone) ~= highest then
         return newAction("zone", "select:" .. highest, 0, "MineSelectZone", {highest},
             function(current) return current.MineGame.CurrentZone end, mine.CurrentZone, "Travel to " .. highest)
     end
 
+    if not app:IsFeatureEnabled("Zones") then highest = "Z" .. tostring(mine.CurrentZone); nextZone = nil end
     local researchDone = Config.IsZoneResearchComplete(mine.Skills or {}, highest)
-    if nextZone and researchDone then
+    if app:IsFeatureEnabled("Zones") and nextZone and researchDone then
         local cost = tonumber(Config.Zones[nextZone].UnlockCost)
         assert(cost, "Missing zone price: " .. nextZone)
         return newAction("zone", "unlock:" .. nextZone, cost, "MineSelectZone", {nextZone},
@@ -507,7 +601,8 @@ local function plan(snapshot)
     if goal then return goal end
     if #picks > 0 then return chooseCheapest(picks) end
     if upgrade then return upgrade end
-    return nil, researchDone and not nextZone and "Final zone researched - farming continues" or "Waiting for progression requirements"
+    return nil, researchDone and highest == Config.ZoneKeys[#Config.ZoneKeys] and "Final zone researched - farming continues"
+        or (app.Master and "Waiting for progression requirements" or "Custom mode / selected systems active")
 end
 
 function app:Inspect()
@@ -515,6 +610,7 @@ function app:Inspect()
     if not snapshot then return {Status = "Waiting for player data"} end
     local action, reason = plan(snapshot)
     return {Status = self.Status, Enabled = self.Enabled, Pending = self.Pending,
+        Master = self.Master, Features = table.clone(self.Features),
         Zone = snapshot.MineGame.CurrentZone, Money = snapshot.Money,
         Action = action and action.Label or reason, Cost = action and action.Cost,
         Confirmed = self.Confirmed, Revenue = self.Revenue, LastError = self.LastError}
@@ -525,6 +621,7 @@ local function perform(action, generation)
     local function send()
         local current = data()
         if not alive(generation) or not current or (tonumber(current.Money) or 0) < action.Cost then return false end
+        if app.SpendingPaused and action.Cost > 0 then return false end
         if action.Read(current) ~= action.Before then return false end
         app.Status = "Running: " .. action.Label
         app.LastAction = action.Label
@@ -540,7 +637,7 @@ local function perform(action, generation)
         confirmed = send()
     end
     if confirmed then
-        app.Confirmed += 1
+        if action.Kind == "reward" then app.RewardsClaimed += 1 else app.Confirmed += 1 end
         app.Failures[action.Key] = nil
         app.LastError = ""
         if action.Kind == "pickaxe" or action.Key == "slots" then app.NextEquip = 0 end
@@ -553,13 +650,14 @@ local function perform(action, generation)
     return confirmed
 end
 
-local function sell(generation)
+local function sell(generation, force)
     local ownPlot = plot()
     local chest = ownPlot and ownPlot:FindFirstChild("Chest")
     local stand = workspace:FindFirstChild("SellStand")
-    if not chest or not stand then app.Status = "Waiting for chest / sell stand"; return end
-    app.Status = "Collecting chest"
-    atLocation(chest, generation, function()
+    if (force or app:IsFeatureEnabled("CollectChest")) and not chest then app.Status = "Waiting for chest"; return end
+    if force or app:IsFeatureEnabled("CollectChest") then
+        app.Status = "Collecting chest"
+        atLocation(chest, generation, function()
         local snapshot = data()
         if not snapshot then return false end
         local before = total(snapshot.MineGame.Chest)
@@ -569,8 +667,10 @@ local function sell(generation)
         return waitFor(function(current)
             return total(current.MineGame.Chest) < before or total(current.MineGame.Ores) > oresBefore
         end, generation)
-    end)
-    if not alive(generation) then return end
+        end)
+    end
+    if not alive(generation) or (not force and not app:IsFeatureEnabled("SellOres")) then return end
+    if not stand then app.Status = "Waiting for sell stand"; return end
     app.Status = "Selling ore"
     atLocation(stand, generation, function()
         local snapshot = data()
@@ -600,21 +700,19 @@ end
 
 function app:SetEnabled(value)
     if self.Destroyed then return end
-    if self.ActiveSince then
-        self.ActiveSeconds += os.clock() - self.ActiveSince
-        self.ActiveSince = nil
-    end
-    self.Generation += 1
-    self.Enabled = value == true
-    if self.Enabled then self.ActiveSince = os.clock() end
+    self.RequestedSale = false
+    table.clear(self.Requests)
+    self.Master = value == true
+    for key in pairs(self.Features) do self.Features[key] = false end
+    self:SyncRunning()
     restorePosition()
-    self.Status = self.Enabled and "Starting" or "Stopped"
     if self.Enabled then self.NextSale = 0; self.NextEquip = 0 end
     if refresh then refresh() end
 end
 
 function app:Destroy()
     if self.Destroyed then return end
+    if self.SaveSettings then pcall(function() self:SaveSettings() end) end
     self:SetEnabled(false)
     self.Destroyed = true
     for _, connection in ipairs(self.Connections) do connection:Disconnect() end
@@ -662,9 +760,9 @@ local function loadBackground()
 end
 
 local palette = {
-    Base = Color3.fromRGB(13, 12, 20), Card = Color3.fromRGB(24, 21, 34),
-    Line = Color3.fromRGB(69, 53, 91), Text = Color3.fromRGB(243, 236, 255),
-    Muted = Color3.fromRGB(148, 160, 188), Purple = Color3.fromRGB(143, 112, 244),
+    Base = Color3.fromRGB(15, 12, 22), Card = Color3.fromRGB(30, 24, 42),
+    Line = Color3.fromRGB(70, 53, 94), Text = Color3.fromRGB(243, 236, 255),
+    Muted = Color3.fromRGB(165, 151, 187), Purple = Color3.fromRGB(183, 151, 244),
     Mint = Color3.fromRGB(92, 225, 183),
 }
 local function connect(signal, callback)
@@ -680,17 +778,62 @@ local function box(parent, name, position, size, color)
     create("UIStroke", {Color = palette.Line, Transparency = 0.4}, frame)
     return frame
 end
+local translations = {
+    ["Your mine. Your settings."] = "ฟาร์มในแบบที่ต้องการ",
+    Home = "หน้าหลัก", Farm = "ฟาร์ม", Miners = "ตัวขุด", Research = "วิจัย", Zones = "ด่านและที่ขุด", Settings = "ตั้งค่า",
+    ["My Anime Mine"] = "My Anime Mine", ["Simple controls. Shared game logic."] = "ควบคุมง่าย ใช้ระบบทำงานร่วมกัน",
+    ["Search this page..."] = "ค้นหาในหน้านี้...", ["Cash"] = "เงินตอนนี้", ["Earned"] = "รายได้จากขายแร่",
+    ["Current zone"] = "ด่านตอนนี้", ["Status"] = "สถานะ", ["One Click"] = "ทำทั้งหมดในคลิกเดียว",
+    ["Run every farm feature together."] = "เปิดระบบฟาร์มและอัปเกรดทุกอย่างร่วมกัน",
+    ["Stop all"] = "หยุดทั้งหมด", ["Sell now"] = "เก็บและขายตอนนี้", ["AFK screen"] = "หน้าจอ AFK",
+    ["Farm only"] = "ฟาร์มอย่างเดียว", ["Team only"] = "อัปตัวขุดอย่างเดียว", ["Research only"] = "วิจัยอย่างเดียว",
+    ["Quick start"] = "เริ่มแบบที่ต้องการ", ["Language"] = "ภาษา", ["English / Thai"] = "อังกฤษ / ไทย",
+    ["Menu size"] = "ขนาดหน้าต่าง", ["Auto fits your screen; adjust to taste."] = "ปรับพอดีจออัตโนมัติ และปรับเพิ่มเองได้",
+    ["Sale timer"] = "รอบเก็บและขาย", ["Jump timer"] = "รอบกระโดดกันหลุด", ["Training budget"] = "งบปั้นตัวใหม่",
+    ["Required improvement"] = "ต้องแรงกว่าเดิม", ["Menu key"] = "ปุ่มเปิดหรือปิดเมนู", ["One Click key"] = "ปุ่มทำทั้งหมด",
+    ["Stop key"] = "ปุ่มหยุดทั้งหมด", ["AFK screen key"] = "ปุ่มหน้าจอ AFK", ["None"] = "ไม่ตั้งปุ่ม",
+    ["Press a key..."] = "กดปุ่มที่ต้องการ...", ["Esc cancels. Backspace clears."] = "Esc ยกเลิก Backspace ล้างปุ่ม",
+    ["Save settings"] = "บันทึกการตั้งค่า", ["Load settings"] = "โหลดการตั้งค่า", ["Reset settings"] = "คืนค่าเริ่มต้น",
+    ["Close script"] = "ปิดสคริปต์", ["Keep game active"] = "กันหลุดเมื่ออยู่นิ่ง", ["Jump and press Space on the timer."] = "กระโดดพร้อมส่งปุ่ม Space ตามรอบเวลา",
+    ["Show background"] = "แสดงภาพพื้นหลัง", ["Use the purple nebula on the AFK screen."] = "ใช้ภาพเนบิวลาสีม่วงในหน้าจอ AFK",
+    ["Pause spending"] = "พักการใช้เงิน", ["Keep farming without buying upgrades."] = "ฟาร์มต่อโดยไม่ซื้อหรืออัปเกรดเพิ่ม",
+    ["Test jump"] = "ทดสอบกระโดด", ["Back to menu"] = "กลับเมนู", ["Start"] = "เริ่ม", ["Stop"] = "หยุด",
+    ["Farming time"] = "เวลาที่ฟาร์ม", ["Upgrades"] = "อัปเกรดสำเร็จ", ["Ready"] = "พร้อมใช้งาน",
+    ["Running"] = "กำลังทำงาน", ["Stopped"] = "หยุดแล้ว", ["Custom mode"] = "โหมดเลือกเอง",
+    ["Waiting for data"] = "รอข้อมูลเกม", ["Wait for the current action to finish."] = "รอให้งานตอนนี้เสร็จก่อน",
+    ["Key already used."] = "ปุ่มนี้ถูกใช้แล้ว", ["Settings saved."] = "บันทึกแล้ว", ["Settings loaded."] = "โหลดแล้ว",
+    ["Settings unavailable."] = "ใช้ไฟล์ตั้งค่าไม่ได้", ["Settings reset."] = "คืนค่าแล้ว",
+}
+local localeBindings = {}
+local function tr(value)
+    return app.Language == "th" and translations[value] or value
+end
+local function localize(instance, value)
+    table.insert(localeBindings, {Instance = instance, English = value})
+    instance:SetAttribute("EnglishText", value)
+    instance.Text = tr(value)
+end
+function app:SetLanguage(language)
+    self.Language = language == "th" and "th" or "en"
+    for _, binding in ipairs(localeBindings) do
+        if binding.Instance.Parent then binding.Instance.Text = tr(binding.English) end
+    end
+    if refresh then refresh() end
+end
 local function text(parent, value, position, size, fontSize, color)
-    return create("TextLabel", {Text = value, Position = position, Size = size, BackgroundTransparency = 1,
+    local label = create("TextLabel", {Text = value, Position = position, Size = size, BackgroundTransparency = 1,
         TextColor3 = color or palette.Text, Font = Enum.Font.GothamMedium, TextSize = fontSize or 14,
         TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
         TextWrapped = true}, parent)
+    localize(label, value)
+    return label
 end
 local function button(parent, name, value, position, size, color)
     local control = create("TextButton", {Name = name, Text = value, Position = position, Size = size,
-        BackgroundColor3 = color or palette.Purple, TextColor3 = palette.Text,
+        BackgroundColor3 = color or palette.Purple, TextColor3 = (not color or color == palette.Purple) and palette.Base or palette.Text,
         Font = Enum.Font.GothamBold, TextSize = 14, BorderSizePixel = 0, AutoButtonColor = true}, parent)
     round(control, 10)
+    localize(control, value)
     return control
 end
 local function metric(parent, name, title, position, size, accent)
@@ -786,212 +929,560 @@ function app:SetAntiAFK(enabled)
     if refresh then refresh() end
 end
 
-screen = create("ScreenGui", {Name = "MyAnimeMineOneClick", ResetOnSpawn = false, DisplayOrder = 100,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling, IgnoreGuiInset = true}, player:WaitForChild("PlayerGui"))
-local panel = box(screen, "Dashboard", UDim2.new(0.5, 0, 0.5, 0), UDim2.fromOffset(760, 540), palette.Base)
-panel.AnchorPoint = Vector2.new(0.5, 0.5)
-panel.Active = true
-local panelScale = create("UIScale", {Scale = 1}, panel)
-local sidebar = box(panel, "Navigation", UDim2.fromOffset(0, 0), UDim2.fromOffset(174, 540), Color3.fromRGB(18, 15, 29))
-local logo = text(sidebar, "M /", UDim2.fromOffset(22, 22), UDim2.fromOffset(134, 42), 34, palette.Purple)
-logo.Font = Enum.Font.GothamBlack
-text(sidebar, "ANIME MINE", UDim2.fromOffset(22, 70), UDim2.fromOffset(134, 22), 15)
-text(sidebar, "ONE CLICK SUITE", UDim2.fromOffset(22, 96), UDim2.fromOffset(134, 18), 9, palette.Muted)
-text(sidebar, "WORKSPACE", UDim2.fromOffset(22, 148), UDim2.fromOffset(134, 18), 10, palette.Muted)
-local overviewTab = button(sidebar, "Overview", "Overview", UDim2.fromOffset(14, 178), UDim2.fromOffset(146, 40), palette.Purple)
-local settingsTab = button(sidebar, "Settings", "Preferences", UDim2.fromOffset(14, 228), UDim2.fromOffset(146, 40), palette.Card)
-local afkButton = button(sidebar, "OpenAFK", "AFK cinema", UDim2.fromOffset(14, 278), UDim2.fromOffset(146, 40), palette.Card)
-local sidebarStatus = text(sidebar, "AUTOMATION\nPAUSED", UDim2.fromOffset(22, 384), UDim2.fromOffset(132, 52), 11, palette.Mint)
-local exitButton = button(sidebar, "Exit", "Unload script", UDim2.fromOffset(14, 470), UDim2.fromOffset(146, 36), palette.Card)
-local title = text(panel, "Overview", UDim2.fromOffset(198, 24), UDim2.fromOffset(430, 30), 24)
-title.Font = Enum.Font.GothamBold
-text(panel, "MY ANIME MINE  /  PROGRESSION CONTROL", UDim2.fromOffset(198, 61), UDim2.fromOffset(500, 20), 10, palette.Muted)
-local hideButton = button(panel, "Hide", "-", UDim2.fromOffset(702, 25), UDim2.fromOffset(34, 30), palette.Card)
-create("Frame", {Position = UDim2.fromOffset(198, 95), Size = UDim2.fromOffset(538, 1), BackgroundColor3 = palette.Line, BorderSizePixel = 0}, panel)
-local overview = create("Frame", {Name = "Overview", Position = UDim2.fromOffset(198, 112), Size = UDim2.fromOffset(538, 386), BackgroundTransparency = 1}, panel)
-local settings = create("Frame", {Name = "Preferences", Visible = false, Position = overview.Position, Size = overview.Size, BackgroundTransparency = 1}, panel)
-local cashValue = metric(overview, "Cash", "WALLET BALANCE", UDim2.fromOffset(0, 0), UDim2.fromOffset(263, 90), palette.Mint)
-local revenueValue = metric(overview, "Revenue", "ORE REVENUE / SESSION", UDim2.fromOffset(275, 0), UDim2.fromOffset(263, 90), palette.Purple)
-local progressCard = box(overview, "Progression", UDim2.fromOffset(0, 104), UDim2.fromOffset(538, 116))
-text(progressCard, "WORLD PROGRESSION", UDim2.fromOffset(16, 12), UDim2.fromOffset(500, 18), 10, palette.Purple)
-local zoneLabel = text(progressCard, "", UDim2.fromOffset(16, 35), UDim2.fromOffset(500, 26), 17)
-local researchLabel = text(progressCard, "", UDim2.fromOffset(16, 66), UDim2.fromOffset(500, 18), 11, palette.Muted)
-local bar = box(progressCard, "Research", UDim2.fromOffset(16, 96), UDim2.fromOffset(506, 5))
-local barFill = create("Frame", {Size = UDim2.fromScale(0, 1), BackgroundColor3 = palette.Purple, BorderSizePixel = 0}, bar)
-round(barFill, 6)
-local statusCard = box(overview, "Activity", UDim2.fromOffset(0, 234), UDim2.fromOffset(538, 84))
-text(statusCard, "CONTROLLER", UDim2.fromOffset(16, 8), UDim2.fromOffset(500, 18), 10, palette.Muted)
-local statusLabel = text(statusCard, "Ready", UDim2.fromOffset(16, 27), UDim2.fromOffset(506, 48), 13)
-local startButton = button(overview, "Start", "START FARMING", UDim2.fromOffset(0, 334), UDim2.fromOffset(244, 44))
-local infoLabel = text(overview, "", UDim2.fromOffset(260, 334), UDim2.fromOffset(278, 44), 11, palette.Muted)
-local errorLabel = text(panel, "", UDim2.fromOffset(198, 499), UDim2.fromOffset(538, 18), 10, Color3.fromRGB(255, 188, 120))
-text(panel, "F6 Run / Stop     End Stop     RightShift Hide     F8 Cinema", UDim2.fromOffset(198, 520), UDim2.fromOffset(538, 14), 9, palette.Muted)
-
-local protection = box(settings, "Protection", UDim2.fromOffset(0, 0), UDim2.fromOffset(538, 104))
-text(protection, "SESSION PROTECTION", UDim2.fromOffset(16, 12), UDim2.fromOffset(500, 20), 11, palette.Purple)
-text(protection, "Jump + Space input every 10 minutes\nWorks independently of farming.", UDim2.fromOffset(16, 41), UDim2.fromOffset(252, 48), 12, palette.Muted)
-local antiButton = button(protection, "AntiAFK", "ANTI-AFK: ON", UDim2.fromOffset(284, 48), UDim2.fromOffset(238, 36), palette.Card)
-local appearance = box(settings, "Appearance", UDim2.fromOffset(0, 118), UDim2.fromOffset(538, 104))
-text(appearance, "CINEMA APPEARANCE", UDim2.fromOffset(16, 12), UDim2.fromOffset(500, 20), 11, palette.Purple)
-text(appearance, "Purple nebula\nYour supplied background, embedded.", UDim2.fromOffset(16, 41), UDim2.fromOffset(252, 48), 12, palette.Muted)
-local backgroundButton = button(appearance, "Background", "BACKGROUND: ON", UDim2.fromOffset(284, 48), UDim2.fromOffset(238, 36), palette.Card)
-local cadence = box(settings, "Cadence", UDim2.fromOffset(0, 236), UDim2.fromOffset(538, 142))
-text(cadence, "FARMING CADENCE", UDim2.fromOffset(16, 12), UDim2.fromOffset(500, 20), 11, palette.Purple)
-text(cadence, "Chest collection & ore sale interval", UDim2.fromOffset(16, 41), UDim2.fromOffset(500, 20), 12, palette.Muted)
-local delayButtons = {}
-for index, seconds in ipairs({20, 40, 60}) do
-    local control = button(cadence, "Delay" .. seconds, tostring(seconds) .. " seconds",
-        UDim2.fromOffset(16 + (index - 1) * 174, 82), UDim2.fromOffset(158, 36), palette.Card)
-    delayButtons[seconds] = control
-    connect(control.Activated, function()
-        app.SellInterval = seconds
-        if app.Enabled then app.NextSale = os.clock() + seconds end
-    end)
-end
-local function selectPage(name)
-    overview.Visible = name == "Overview"
-    settings.Visible = name == "Preferences"
-    title.Text = name
-    overviewTab.BackgroundColor3 = overview.Visible and palette.Purple or palette.Card
-    settingsTab.BackgroundColor3 = settings.Visible and palette.Purple or palette.Card
-end
-connect(overviewTab.Activated, function() selectPage("Overview") end)
-connect(settingsTab.Activated, function() selectPage("Preferences") end)
-
-local overlay = create("Frame", {Name = "AFKView", Visible = false, Size = UDim2.fromScale(1, 1),
-    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Active = true, ZIndex = 10}, screen)
-create("UIGradient", {Color = ColorSequence.new(Color3.fromRGB(25, 19, 47), Color3.fromRGB(7, 17, 25)), Rotation = 25}, overlay)
-local background = create("ImageLabel", {Name = "NeonBackground", Size = UDim2.fromScale(1, 1),
-    BackgroundTransparency = 1, Image = "", ScaleType = Enum.ScaleType.Fit, ImageTransparency = 0.08, ZIndex = 1}, overlay)
-app.BackgroundEnabled = true
-function app:SetBackground(enabled)
-    self.BackgroundEnabled = enabled == true
-    background.Visible = self.BackgroundEnabled
-    backgroundButton.Text = self.BackgroundEnabled and "BACKGROUND: ON" or "BACKGROUND: OFF"
-end
-connect(backgroundButton.Activated, function() app:SetBackground(not app.BackgroundEnabled) end)
-task.spawn(function()
-    local ok, result = pcall(loadBackground)
-    if app.Destroyed then return end
-    if ok then
-        backgroundAsset = result
-        background.Image = result
-    else
-        backgroundError = "Background: " .. tostring(result)
+screen = create("ScreenGui", {Name="MyAnimeMineOneClick", ResetOnSpawn=false, DisplayOrder=100, ZIndexBehavior=Enum.ZIndexBehavior.Sibling, IgnoreGuiInset=true}, player:WaitForChild("PlayerGui"))
+local Tween = game:GetService("TweenService")
+local panel = box(screen,"Dashboard",UDim2.fromScale(0.5,0.5),UDim2.fromOffset(810,600),palette.Base)
+panel.AnchorPoint=Vector2.new(0.5,0.5)
+panel.Active=true
+local panelScale=create("UIScale",{Scale=1},panel)
+local heading=text(panel,"My Anime Mine",UDim2.fromOffset(20,14),UDim2.fromOffset(600,32),22)
+local subtitle=text(panel,"Your mine. Your settings.",UDim2.fromOffset(20,48),UDim2.fromOffset(600,22),12,palette.Muted)
+local hideButton=button(panel,"Hide","×",UDim2.new(1,-52,0,16),UDim2.fromOffset(34,34),palette.Card)
+local tabs=create("ScrollingFrame",{Name="Tabs",BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=0,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y},panel)
+local tabLayout=create("UIListLayout",{Padding=UDim.new(0,8),SortOrder=Enum.SortOrder.LayoutOrder},tabs)
+local search=create("TextBox",{Name="Search",Text="",ClearTextOnFocus=false,BackgroundColor3=palette.Card,TextColor3=palette.Text,PlaceholderColor3=palette.Muted,BorderSizePixel=0,TextSize=15,Font=Enum.Font.Gotham,TextXAlignment=Enum.TextXAlignment.Left},panel)
+round(search,7)
+create("UIPadding",{PaddingLeft=UDim.new(0,12),PaddingRight=UDim.new(0,12)},search)
+local body=create("Frame",{Name="Pages",BackgroundTransparency=1},panel)
+local notice=text(panel,"",UDim2.new(),UDim2.new(),11,Color3.fromRGB(255,195,130))
+local hint=text(panel,"",UDim2.new(),UDim2.new(),10,palette.Muted)
+local pages,navigation,rows,switches={},{},{},{}
+local pageColumns,pageRows={},{}
+local selectedPage,captureKey,preferenceNotice="Home",nil,""
+local function page(name,thai,order)
+    translations[name]=thai
+    local frame=create("ScrollingFrame",{Name=name,Size=UDim2.fromScale(1,1),Visible=order==1,BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=3,ScrollBarImageColor3=palette.Purple,AutomaticCanvasSize=Enum.AutomaticSize.Y,CanvasSize=UDim2.new()},body)
+    create("UIPadding",{PaddingLeft=UDim.new(0,2),PaddingRight=UDim.new(0,8),PaddingTop=UDim.new(0,2),PaddingBottom=UDim.new(0,10)},frame)
+    local columns={}
+    for index=1,2 do
+        columns[index]=create("Frame",{Name="Column"..index,BackgroundTransparency=1,
+            Size=UDim2.new(0.5,-6,0,0),Position=UDim2.new((index-1)*0.5,(index-1)*6,0,0),AutomaticSize=Enum.AutomaticSize.Y},frame)
+        create("UIListLayout",{Padding=UDim.new(0,10),SortOrder=Enum.SortOrder.LayoutOrder},columns[index])
     end
+    pageColumns[frame],pageRows[frame]=columns,{}
+    local tab=button(tabs,name,name,UDim2.new(),UDim2.fromOffset(150,42),palette.Card)
+    tab.LayoutOrder=order
+    pages[name],navigation[name]=frame,tab
+    return frame
+end
+local home=page("Home","หน้าหลัก",1)
+local farm=page("Farm","ฟาร์ม",2)
+local team=page("Miners","ตัวขุด",3)
+local research=page("Research","วิจัย",4)
+local worlds=page("Zones","ด่านและที่ขุด",5)
+local rewards=page("Rewards","รางวัล",6)
+local settings=page("Settings","ตั้งค่า",7)
+local function registerRow(parent,frame,order)
+    if pageRows[parent] then
+        table.insert(pageRows[parent],frame)
+        frame.Parent=pageColumns[parent][order%2==1 and 1 or 2]
+    end
+end
+local function card(parent,name,height,order)
+    local frame=box(parent,name,UDim2.new(),UDim2.new(1,0,0,height))
+    frame.LayoutOrder=order
+    registerRow(parent,frame,order)
+    return frame
+end
+local function switch(parent,name,en,thai,description,thaiDescription,order,getter,callback)
+    translations[en],translations[description]=thai,thaiDescription
+    local row=create("TextButton",{Name=name,Text="",AutoButtonColor=false,BackgroundColor3=palette.Card,Size=UDim2.new(1,0,0,82),BorderSizePixel=0,LayoutOrder=order},parent)
+    round(row,7)
+    registerRow(parent,row,order)
+    local stroke=create("UIStroke",{Color=palette.Line,Transparency=0.5},row)
+    text(row,en,UDim2.fromOffset(16,10),UDim2.new(1,-98,0,26),16)
+    text(row,description,UDim2.fromOffset(16,39),UDim2.new(1,-98,0,33),12,palette.Muted)
+    local track=create("Frame",{Position=UDim2.new(1,-68,0.5,-13),Size=UDim2.fromOffset(48,26),BackgroundColor3=palette.Line,BorderSizePixel=0},row)
+    round(track,14)
+    local knob=create("Frame",{Position=UDim2.fromOffset(4,4),Size=UDim2.fromOffset(18,18),BackgroundColor3=palette.Text,BorderSizePixel=0},track)
+    round(knob,10)
+    table.insert(switches,{Row=row,Track=track,Knob=knob,Get=getter})
+    table.insert(rows,{Row=row,Search=(en.." "..description.." "..thai.." "..thaiDescription):lower()})
+    connect(row.Activated,function() callback(not getter()); if refresh then refresh() end end)
+    connect(row.MouseEnter,function() Tween:Create(stroke,TweenInfo.new(0.15),{Transparency=0}):Play() end)
+    connect(row.MouseLeave,function() Tween:Create(stroke,TweenInfo.new(0.15),{Transparency=0.5}):Play() end)
+end
+local summary=card(home,"Summary",174,1)
+text(summary,"Cash",UDim2.fromOffset(16,10),UDim2.new(0.5,-24,0,22),12,palette.Muted)
+local cashValue=text(summary,"--",UDim2.fromOffset(16,37),UDim2.new(0.5,-24,0,34),24,palette.Mint)
+text(summary,"Earned",UDim2.new(0.5,10,0,10),UDim2.new(0.5,-26,0,22),12,palette.Muted)
+local revenueValue=text(summary,"--",UDim2.new(0.5,10,0,37),UDim2.new(0.5,-26,0,34),24,palette.Purple)
+local zoneLabel=text(summary,"",UDim2.fromOffset(16,86),UDim2.new(1,-32,0,24),16)
+local researchLabel=text(summary,"",UDim2.fromOffset(16,116),UDim2.new(1,-32,0,22),12,palette.Muted)
+local bar=create("Frame",{Position=UDim2.fromOffset(16,151),Size=UDim2.new(1,-32,0,5),BackgroundColor3=palette.Line,BorderSizePixel=0},summary)
+round(bar,4)
+local barFill=create("Frame",{Size=UDim2.fromScale(0,1),BackgroundColor3=palette.Purple,BorderSizePixel=0},bar)
+round(barFill,4)
+switch(home,"OneClick","One Click","ทำทั้งหมดในคลิกเดียว","Run every farm feature together.","เปิดระบบฟาร์มและอัปเกรดทุกอย่างร่วมกัน",2,function() return app.Master end,function(value) app:SetEnabled(value) end)
+local actions=card(home,"Actions",112,3)
+local stopButton=button(actions,"Stop","Stop all",UDim2.fromOffset(12,12),UDim2.new(0.5,-18,0,44),Color3.fromRGB(105,55,75))
+local sellButton=button(actions,"Sell","Sell now",UDim2.new(0.5,6,0,12),UDim2.new(0.5,-18,0,44),palette.Card)
+local afkButton=button(actions,"AFK","AFK screen",UDim2.fromOffset(12,62),UDim2.new(1,-24,0,44))
+local statusCard=card(home,"Status",88,4)
+text(statusCard,"Status",UDim2.fromOffset(16,8),UDim2.new(1,-32,0,22),12,palette.Muted)
+local statusLabel=text(statusCard,"",UDim2.fromOffset(16,33),UDim2.new(1,-32,0,48),13)
+local presetCard=card(home,"Presets",190,5)
+text(presetCard,"Quick start",UDim2.fromOffset(16,7),UDim2.new(1,-32,0,24),15)
+local presetButtons={}
+for index,name in ipairs({"Farm only","Team only","Research only"}) do
+    presetButtons[name]=button(presetCard,name,name,UDim2.fromOffset(12,34+(index-1)*50),UDim2.new(1,-24,0,44),palette.Card)
+end
+local function feature(parent,key,en,thai,description,thaiDescription,order)
+    switch(parent,key,en,thai,description,thaiDescription,order,function() return app:IsFeatureEnabled(key) end,function(value) app:SetFeature(key,value) end)
+end
+feature(farm,"CollectChest","Collect chest","เก็บของจากหีบ","Take the items stored on your plot.","เก็บของที่สะสมอยู่ในหีบของเรา",1)
+feature(farm,"SellOres","Sell ore","ขายแร่","Sell ore from your bag. Keep characters.","ขายเฉพาะแร่ในกระเป๋า เก็บตัวละครไว้",2)
+feature(farm,"ClickNodes","Auto mine","ขุดอัตโนมัติ","Click the rocks on your plot.","ช่วยคลิกก้อนแร่ในพื้นที่ของเรา",3)
+switch(farm,"PauseSpending","Pause spending","พักการใช้เงิน","Keep farming without buying upgrades.","ฟาร์มต่อโดยไม่ซื้อหรืออัปเกรดเพิ่ม",4,function() return app.SpendingPaused end,function(value) app.SpendingPaused=value end)
+local crewInfo=card(team,"Levels",120,1)
+local crewReadout=text(crewInfo,"",UDim2.fromOffset(14,10),UDim2.new(1,-28,1,-20),12,palette.Muted)
+crewReadout.TextYAlignment=Enum.TextYAlignment.Top
+feature(team,"EquipBest","Use best team","ใส่ทีมที่ดีที่สุด","Use your strongest characters right now.","เลือกตัวที่แรงที่สุดจากค่าที่มีตอนนี้",2)
+feature(team,"TrainTeam","Train better characters","ปั้นตัวใหม่ที่คุ้มกว่า","Train a new miner only when it will be stronger.","คำนวณงบปั้นให้แรงกว่าเดิมก่อนเปลี่ยนตัว",3)
+feature(team,"Damage","Upgrade damage","อัปดาเมจ","Make placed characters hit harder.","เพิ่มดาเมจให้ตัวละครที่วางไว้",4)
+feature(team,"MineSpeed","Upgrade mining speed","อัปความเร็วขุด","Make your characters mine faster.","เพิ่มความถี่การขุดของตัวละคร",5)
+feature(team,"Speed","Upgrade walk speed","อัปความเร็วเดิน","Make miners and haulers move faster.","เพิ่มความเร็วเดินของตัวขุดและตัวขน",6)
+feature(research,"Research","Skill Tree","อัปสกิล","Buy open skills in your current zone.","ซื้อสกิลที่เปิดให้ซื้อในด่านปัจจุบัน",1)
+feature(research,"Tap","Upgrade click power","อัปพลังคลิก","Make your own mining clicks stronger.","เพิ่มดาเมจการคลิกขุดของเรา",2)
+feature(worlds,"Pickaxes","Buy better pickaxes","ซื้อที่ขุดที่ดีกว่า","Buy stronger pickaxes when the shop has stock.","ซื้อที่ขุดที่แรงขึ้นเมื่อร้านมีของ",1)
+feature(worlds,"Zones","Unlock next zone","ปลดล็อกด่านถัดไป","Finish research, save money and move forward.","วิจัยให้ครบ เก็บเงิน แล้วไปด่านต่อไป",2)
+feature(worlds,"Slots","Buy miner slots","ซื้อช่องตัวขุด","Buy more base slots for your miners.","ซื้อช่องวางตัวขุดพื้นฐานเพิ่ม",3)
+feature(rewards,"ClaimIndex","Auto claim Index","รับรางวัล Index อัตโนมัติ","Claim each unlocked Index reward once.","รับแต่ละรางวัล Index ที่ครบเงื่อนไข",1)
+feature(rewards,"ClaimDaily","Auto claim Daily Reward","รับรางวัลรายวันอัตโนมัติ","Claim Daily Reward and completed Daily Quests.","รับ Daily Reward และเควสต์รายวันที่ทำครบ",2)
+feature(rewards,"ClaimEvents","Auto claim Events","รับรางวัล Event อัตโนมัติ","Claim completed event milestones and personal rewards.","รับรางวัล Event และรางวัลส่วนตัวที่ครบเงื่อนไข",3)
+local instant=card(rewards,"ClaimNow",76,4)
+translations["Claim rewards now"]="รับรางวัลตอนนี้"
+local claimButton=button(instant,"Claim","Claim rewards now",UDim2.fromOffset(12,14),UDim2.new(1,-24,0,46),palette.Card)
+connect(claimButton.Activated,function() app:QueueAction("rewards") end)
+local equipCard=card(team,"EquipNow",76,8)
+translations["Equip best team now"]="ใส่ทีมที่ดีที่สุดตอนนี้"
+local equipButton=button(equipCard,"Equip","Equip best team now",UDim2.fromOffset(12,14),UDim2.new(1,-24,0,46),palette.Card)
+connect(equipButton.Activated,function() app:QueueAction("equip") end)
+local function setting(name,order)
+    local frame=card(settings,name,94,order)
+    text(frame,name,UDim2.fromOffset(16,9),UDim2.new(1,-32,0,25),15)
+    return frame
+end
+local cycleButtons={}
+local closeDropdown
+local function dropdown(frame,values,getter,setter,formatter)
+    local control=button(frame,"Value","",UDim2.fromOffset(12,40),UDim2.new(1,-24,0,44),palette.Card)
+    local options=create("Frame",{Name="Options",Position=UDim2.fromOffset(12,92),Size=UDim2.new(1,-24,0,#values*44+8),
+        BackgroundColor3=palette.Base,BorderSizePixel=0,Visible=false},frame)
+    round(options,7)
+    local function close()
+        options.Visible=false
+        frame.Size=UDim2.new(1,0,0,94)
+    end
+    for index,value in ipairs(values) do
+        local option=button(options,"Option"..index,formatter(value),UDim2.fromOffset(4,4+(index-1)*44),UDim2.new(1,-8,0,40),palette.Card)
+        connect(option.Activated,function() setter(value); close(); if refresh then refresh() end end)
+        table.insert(cycleButtons,{Control=option,Get=function() return value end,Format=formatter})
+    end
+    table.insert(cycleButtons,{Control=control,Get=getter,Format=function(value) return formatter(value).."  v" end})
+    connect(control.Activated,function()
+        local opening=not options.Visible
+        if closeDropdown then closeDropdown() end
+        if opening then
+            options.Visible=true
+            frame.Size=UDim2.new(1,0,0,104+#values*44)
+            closeDropdown=close
+        else closeDropdown=nil end
+    end)
+    return control
+end
+local languageRow=setting("Language",1)
+local languageButton=dropdown(languageRow,{"en","th"},function() return app.Language end,function(value) app:SetLanguage(value) end,
+    function(value) return value=="th" and "ไทย" or "English" end)
+local scaleRow=setting("Menu size",2)
+local scaleDown=button(scaleRow,"Smaller","−",UDim2.fromOffset(12,40),UDim2.fromOffset(44,44),palette.Card)
+local scaleValue=text(scaleRow,"",UDim2.fromOffset(62,40),UDim2.new(1,-186,0,32),13)
+local scaleUp=button(scaleRow,"Larger","+",UDim2.new(1,-114,0,40),UDim2.fromOffset(44,44),palette.Card)
+local scaleAuto=button(scaleRow,"Auto","Auto",UDim2.new(1,-64,0,40),UDim2.fromOffset(52,44),palette.Card)
+translations.Auto="อัตโนมัติ"
+switch(settings,"AntiAFK","Keep game active","กันหลุดเมื่ออยู่นิ่ง","Jump and press Space on the timer.","กระโดดพร้อมส่งปุ่ม Space ตามรอบเวลา",3,function() return app.AntiAFK end,function(value) app:SetAntiAFK(value) end)
+switch(settings,"Background","Show background","แสดงภาพพื้นหลัง","Use the purple nebula on the AFK screen.","ใช้ภาพเนบิวลาสีม่วงในหน้าจอ AFK",4,function() return app.BackgroundEnabled end,function(value) app:SetBackground(value) end)
+local function cycle(name,order,values,getter,setter,formatter)
+    local frame=setting(name,order)
+    dropdown(frame,values,getter,setter,formatter)
+end
+cycle("Sale timer",5,{20,40,60,120},function() return app.SellInterval end,function(value) app.SellInterval=value; app.NextSale=0 end,function(value) return value..(app.Language=="th" and " วินาที" or " seconds") end)
+cycle("Jump timer",6,{300,600,900},function() return app.AntiAFKInterval end,function(value) app.AntiAFKInterval=value; app.NextAntiAFK=os.clock()+value end,function(value) return (value/60)..(app.Language=="th" and " นาที" or " minutes") end)
+cycle("Training budget",7,{0.1,0.2,0.3},function() return app.TrainBudget end,function(value) if app.Training then preferenceNotice="Wait for the current action to finish." else app.TrainBudget=value end end,function(value) return math.floor(value*100).."%" end)
+cycle("Required improvement",8,{1.1,1.25,1.5},function() return app.TrainGain end,function(value) if app.Training then preferenceNotice="Wait for the current action to finish." else app.TrainGain=value end end,function(value) return "+"..math.floor((value-1)*100+0.5).."%" end)
+local keyButtons={}
+local keyNames={Menu="Menu key",OneClick="One Click key",Stop="Stop key",AFK="AFK screen key"}
+for index,key in ipairs({"Menu","OneClick","Stop","AFK"}) do
+    local frame=setting(keyNames[key],8+index)
+    local control=button(frame,"Bind","",UDim2.fromOffset(12,40),UDim2.new(1,-24,0,44),palette.Card)
+    keyButtons[key]=control
+    connect(control.Activated,function() captureKey=key; preferenceNotice="Esc cancels. Backspace clears." end)
+end
+local fileCard=card(settings,"SavedSettings",112,13)
+local saveButton=button(fileCard,"Save","Save settings",UDim2.fromOffset(12,12),UDim2.new(0.5,-18,0,44),palette.Card)
+local loadButton=button(fileCard,"Load","Load settings",UDim2.new(0.5,6,0,12),UDim2.new(0.5,-18,0,44),palette.Card)
+local resetButton=button(fileCard,"Reset","Reset settings",UDim2.fromOffset(12,62),UDim2.new(1,-24,0,44),palette.Card)
+local toolsCard=card(settings,"Tools",62,14)
+local jumpButton=button(toolsCard,"Jump","Test jump",UDim2.fromOffset(12,12),UDim2.new(0.5,-18,0,44),palette.Card)
+local exitButton=button(toolsCard,"Unload","Close script",UDim2.new(0.5,6,0,12),UDim2.new(0.5,-18,0,44),palette.Card)
+local mobileButton=button(screen,"MobileMenu","M",UDim2.new(0,10,0.5,-24),UDim2.fromOffset(48,48))
+mobileButton.ZIndex=30
+mobileButton.TextSize=23
+local overlay=create("Frame",{Name="AFKView",Visible=false,Size=UDim2.fromScale(1,1),BackgroundColor3=palette.Base,BorderSizePixel=0,Active=true,ZIndex=10},screen)
+local background=create("ImageLabel",{Name="NeonBackground",Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Image="",ScaleType=Enum.ScaleType.Crop,ImageTransparency=0.12},overlay)
+create("Frame",{Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.new(),BackgroundTransparency=0.35,BorderSizePixel=0},overlay)
+app.BackgroundEnabled=true
+function app:SetBackground(enabled) self.BackgroundEnabled=enabled==true; background.Visible=self.BackgroundEnabled end
+task.spawn(function()
+    local ok,result=pcall(loadBackground)
+    if app.Destroyed then return end
+    if ok then backgroundAsset=result; background.Image=result else backgroundError="Background: "..tostring(result) end
 end)
-local canvas = create("Frame", {Name = "Content", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-    Size = UDim2.fromOffset(1040, 590), BackgroundTransparency = 1, ZIndex = 2}, overlay)
-local overlayScale = create("UIScale", {Scale = 1}, canvas)
-text(canvas, "MY ANIME MINE", UDim2.fromOffset(28, 18), UDim2.fromOffset(430, 28), 18, palette.Purple)
-text(canvas, "SESSION OVERVIEW", UDim2.fromOffset(28, 48), UDim2.fromOffset(430, 18), 11, palette.Muted)
-local overlayAnti = button(canvas, "AntiAFK", "ANTI-AFK / ON", UDim2.fromOffset(770, 20), UDim2.fromOffset(242, 42), palette.Card)
-local afkCash = metric(canvas, "Wallet", "CURRENT CASH", UDim2.fromOffset(28, 112), UDim2.fromOffset(252, 94), palette.Mint)
-local afkRevenue = metric(canvas, "Earned", "ORE REVENUE / SESSION", UDim2.fromOffset(28, 220), UDim2.fromOffset(252, 94), palette.Purple)
-local afkUpgrades = metric(canvas, "Upgrades", "CONFIRMED UPGRADES", UDim2.fromOffset(28, 328), UDim2.fromOffset(252, 94))
-local afkStock = text(canvas, "", UDim2.fromOffset(30, 440), UDim2.fromOffset(248, 90), 13, palette.Muted)
-local emblem = box(canvas, "Emblem", UDim2.fromOffset(730, 112), UDim2.fromOffset(42, 42), palette.Purple)
-local emblemText = text(emblem, "M", UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), 34)
-emblemText.TextXAlignment = Enum.TextXAlignment.Center
-emblemText.Font = Enum.Font.GothamBlack
-text(canvas, "AFTER HOURS", UDim2.fromOffset(786, 110), UDim2.fromOffset(226, 28), 22)
-local activityLabel = text(canvas, "AUTOMATION PAUSED", UDim2.fromOffset(786, 140), UDim2.fromOffset(226, 20), 10, palette.Mint)
-local timerCard = box(canvas, "Timer", UDim2.fromOffset(730, 194), UDim2.fromOffset(282, 132))
-text(timerCard, "ACTIVE FARMING TIME", UDim2.fromOffset(20, 18), UDim2.fromOffset(242, 20), 11, palette.Muted)
-local timerLabel = text(timerCard, "00:00:00", UDim2.fromOffset(20, 45), UDim2.fromOffset(242, 65), 38)
-timerLabel.Font = Enum.Font.GothamBold
-local afkZone = text(canvas, "", UDim2.fromOffset(732, 345), UDim2.fromOffset(278, 48), 15)
-local afkStatus = text(canvas, "", UDim2.fromOffset(732, 401), UDim2.fromOffset(278, 60), 13, palette.Muted)
-local afkLast = text(canvas, "", UDim2.fromOffset(30, 527), UDim2.fromOffset(250, 40), 11, palette.Muted)
-local closeAFK = button(canvas, "CloseAFK", "BACK TO DASHBOARD", UDim2.fromOffset(730, 490), UDim2.fromOffset(282, 42))
-local overlayStart = button(canvas, "Start", "START", UDim2.fromOffset(730, 544), UDim2.fromOffset(282, 34), palette.Card)
-
+local canvas=create("Frame",{Name="Content",AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),Size=UDim2.fromOffset(680,580),BackgroundTransparency=1,ZIndex=2},overlay)
+local overlayScale=create("UIScale",{Scale=1},canvas)
+text(canvas,"My Anime Mine",UDim2.fromOffset(20,10),UDim2.new(1,-40,0,40),28)
+local afkCash=metric(canvas,"Wallet","Cash",UDim2.fromOffset(20,74),UDim2.new(0.5,-28,0,88),palette.Mint)
+local afkRevenue=metric(canvas,"Earned","Earned",UDim2.new(0.5,8,0,74),UDim2.new(0.5,-28,0,88),palette.Purple)
+local timerCard=box(canvas,"Timer",UDim2.fromOffset(20,178),UDim2.new(1,-40,0,104))
+text(timerCard,"Farming time",UDim2.fromOffset(18,8),UDim2.new(1,-36,0,24),13,palette.Muted)
+local timerLabel=text(timerCard,"00:00:00",UDim2.fromOffset(18,36),UDim2.new(1,-36,0,54),40)
+local afkZone=text(canvas,"",UDim2.fromOffset(22,300),UDim2.new(1,-44,0,30),18)
+local afkStatus=text(canvas,"",UDim2.fromOffset(22,342),UDim2.new(1,-44,0,56),14)
+local afkDetail=text(canvas,"",UDim2.fromOffset(22,404),UDim2.new(1,-44,0,50),13,palette.Muted)
+local closeAFK=button(canvas,"CloseAFK","Back to menu",UDim2.fromOffset(20,480),UDim2.new(0.65,-26,0,48))
+local overlayStart=button(canvas,"Start","Start",UDim2.new(0.65,6,0,480),UDim2.new(0.35,-26,0,48),palette.Card)
+local afkAnti=text(canvas,"",UDim2.fromOffset(22,542),UDim2.new(1,-44,0,28),12,palette.Mint)
 function app:SetAFKView(enabled)
     if self.Destroyed then return end
-    self.ShowAFK = enabled == true
-    overlay.Visible = self.ShowAFK
-    panel.Visible = not self.ShowAFK
+    self.ShowAFK=enabled==true
+    overlay.Visible=self.ShowAFK
+    panel.Visible=not self.ShowAFK
 end
-connect(startButton.Activated, function() app:SetEnabled(not app.Enabled) end)
-connect(overlayStart.Activated, function() app:SetEnabled(not app.Enabled) end)
-connect(afkButton.Activated, function() app:SetAFKView(true) end)
-connect(closeAFK.Activated, function() app:SetAFKView(false) end)
-connect(antiButton.Activated, function() app:SetAntiAFK(not app.AntiAFK) end)
-connect(overlayAnti.Activated, function() app:SetAntiAFK(not app.AntiAFK) end)
-connect(hideButton.Activated, function() panel.Visible = false end)
-connect(exitButton.Activated, function() app:Destroy() end)
-connect(Input.InputBegan, function(input, processed)
+local function toggleMenu() if app.ShowAFK then app:SetAFKView(false) else panel.Visible=not panel.Visible end end
+local function selectPage(name)
+    if closeDropdown then closeDropdown(); closeDropdown=nil end
+    selectedPage=name
+    for key,frame in pairs(pages) do frame.Visible=key==name end
+    for key,tab in pairs(navigation) do
+        tab.BackgroundColor3=key==name and palette.Purple or palette.Card
+        tab.TextColor3=key==name and palette.Base or palette.Text
+    end
+    search.Text=""
+end
+for name,control in pairs(navigation) do connect(control.Activated,function() selectPage(name) end) end
+connect(search:GetPropertyChangedSignal("Text"),function()
+    local query=search.Text:lower()
+    for _,frame in pairs(pages) do
+        for _,row in ipairs(pageRows[frame] or {}) do
+            if row:IsA("GuiObject") then
+                local terms={row.Name}
+                for _,child in ipairs(row:GetDescendants()) do
+                    if child:IsA("TextLabel") or child:IsA("TextButton") then
+                        local english=child:GetAttribute("EnglishText") or ""
+                        table.insert(terms,child.Text.." "..english.." "..(translations[english] or ""))
+                    end
+                end
+                row.Visible=query=="" or table.concat(terms," "):lower():find(query,1,true)~=nil
+            end
+        end
+    end
+end)
+connect(stopButton.Activated,function() app:SetEnabled(false) end)
+connect(sellButton.Activated,function()
+    app:QueueAction("sale")
+end)
+connect(afkButton.Activated,function() app:SetAFKView(true) end)
+connect(closeAFK.Activated,function() app:SetAFKView(false) end)
+connect(overlayStart.Activated,function() app:SetEnabled(not app.Enabled) end)
+connect(hideButton.Activated,function() panel.Visible=false end)
+connect(exitButton.Activated,function() app:Destroy() end)
+connect(scaleDown.Activated,function() app.UIScale=math.max(0.75,app.UIScale-0.1) end)
+connect(scaleUp.Activated,function() app.UIScale=math.min(1.3,app.UIScale+0.1) end)
+connect(scaleAuto.Activated,function() app.UIScale=1; panel.Position=UDim2.fromScale(0.5,0.5) end)
+connect(jumpButton.Activated,function() app:TestAntiAFK() end)
+local presetFeatures={["Farm only"]={"CollectChest","SellOres","ClickNodes"},["Team only"]={"EquipBest","Damage","Speed","MineSpeed"},["Research only"]={"Research"}}
+for name,control in pairs(presetButtons) do connect(control.Activated,function()
+    app:SetEnabled(false)
+    for _,key in ipairs(presetFeatures[name]) do app.Features[key]=true end
+    app:SyncRunning()
+end) end
+local function validKey(value)
+    if value=="None" then return true end
+    local ok,key=pcall(function() return Enum.KeyCode[value] end)
+    return ok and key~=nil and key~=Enum.KeyCode.Unknown
+end
+local function applySettings(saved)
+    assert(type(saved)=="table","Invalid settings")
+    local keys,used={},{}
+    for name,fallback in pairs({Menu="RightShift",OneClick="F6",Stop="End",AFK="F8"}) do
+        local key=saved.Keys and saved.Keys[name] or fallback
+        assert(type(key)=="string" and validKey(key),"Invalid key")
+        assert(key=="None" or not used[key],"Duplicate key")
+        used[key],keys[name]=true,key
+    end
+    local scale,sale,jump=tonumber(saved.UIScale),tonumber(saved.SellInterval),tonumber(saved.AntiAFKInterval)
+    local budget,gain=tonumber(saved.TrainBudget),tonumber(saved.TrainGain)
+    assert(scale and scale==scale and scale>=0.75 and scale<=1.3,"Invalid scale")
+    assert(table.find({20,40,60,120},sale) and table.find({300,600,900},jump),"Invalid timer")
+    assert(table.find({0.1,0.2,0.3},budget) and table.find({1.1,1.25,1.5},gain),"Invalid training settings")
+    assert(not app.Training,"Wait for training")
+    local restoredFeatures={}
+    for key in pairs(app.Features) do
+        local value=type(saved.Features)=="table" and saved.Features[key] or false
+        assert(value==nil or type(value)=="boolean","Invalid feature")
+        restoredFeatures[key]=value==true
+    end
+    assert(saved.Master==nil or type(saved.Master)=="boolean","Invalid One Click setting")
+    app.Keys,app.UIScale,app.SellInterval=keys,scale,sale
+    app.AntiAFKInterval,app.TrainBudget,app.TrainGain=jump,budget,gain
+    app.NextAntiAFK=os.clock()+jump
+    app:SetLanguage(saved.Language)
+    if saved.Version==2 then
+        app:SetAntiAFK(saved.AntiAFK~=false)
+        app:SetBackground(saved.BackgroundEnabled~=false)
+        app.SpendingPaused=saved.SpendingPaused==true
+        app.Master=saved.Master==true
+        app.Features=restoredFeatures
+        app:SyncRunning()
+        app.NextSale,app.NextEquip,app.NextTeamCheck,app.NextRewards=0,0,0,0
+    end
+end
+local function preferences()
+    return {Version=2,Language=app.Language,Keys=table.clone(app.Keys),UIScale=app.UIScale,SellInterval=app.SellInterval,
+        AntiAFKInterval=app.AntiAFKInterval,TrainBudget=app.TrainBudget,TrainGain=app.TrainGain,
+        Master=app.Master,Features=table.clone(app.Features),AntiAFK=app.AntiAFK,
+        BackgroundEnabled=app.BackgroundEnabled,SpendingPaused=app.SpendingPaused}
+end
+local settingsPath="MyAnimeMine-Settings-"..tostring(player.UserId)..".json"
+local lastSavedSettings
+function app:SaveSettings()
+    assert(type(writefile)=="function","Settings file API unavailable")
+    local encoded=game:GetService("HttpService"):JSONEncode(preferences())
+    if encoded~=lastSavedSettings then writefile(settingsPath,encoded); lastSavedSettings=encoded end
+end
+connect(saveButton.Activated,function()
+    local ok=pcall(function() app:SaveSettings() end)
+    preferenceNotice=ok and "Settings saved." or "Settings unavailable."
+end)
+connect(loadButton.Activated,function()
+    local ok=pcall(function() assert(type(readfile)=="function"); applySettings(game:GetService("HttpService"):JSONDecode(readfile(settingsPath))) end)
+    preferenceNotice=ok and "Settings loaded." or "Settings unavailable."
+end)
+connect(resetButton.Activated,function()
+    if app.Training then preferenceNotice="Wait for the current action to finish."; return end
+    applySettings({Language="en",Keys={Menu="RightShift",OneClick="F6",Stop="End",AFK="F8"},UIScale=1,SellInterval=20,AntiAFKInterval=600,TrainBudget=0.2,TrainGain=1.1})
+    preferenceNotice="Settings reset."
+end)
+connect(Input.InputBegan,function(input,processed)
+    if captureKey then
+        if input.UserInputType~=Enum.UserInputType.Keyboard then return end
+        if input.KeyCode==Enum.KeyCode.Escape then captureKey=nil; preferenceNotice=""; return end
+        local name=input.KeyCode==Enum.KeyCode.Backspace and "None" or input.KeyCode.Name
+        if not validKey(name) then return end
+        for action,key in pairs(app.Keys) do if action~=captureKey and key==name and name~="None" then preferenceNotice="Key already used."; return end end
+        app.Keys[captureKey]=name
+        captureKey,preferenceNotice=nil,""
+        return
+    end
     if processed or Input:GetFocusedTextBox() then return end
-    if input.KeyCode == Enum.KeyCode.F6 then app:SetEnabled(not app.Enabled)
-    elseif input.KeyCode == Enum.KeyCode.End then app:SetEnabled(false)
-    elseif input.KeyCode == Enum.KeyCode.F8 then app:SetAFKView(not app.ShowAFK)
-    elseif input.KeyCode == Enum.KeyCode.RightShift then
-        if app.ShowAFK then app:SetAFKView(false) else panel.Visible = not panel.Visible end
-    end
+    local name=input.KeyCode.Name
+    if name==app.Keys.Stop then app:SetEnabled(false)
+    elseif name==app.Keys.OneClick then app:SetEnabled(not app.Master)
+    elseif name==app.Keys.Menu then toggleMenu()
+    elseif name==app.Keys.AFK then app:SetAFKView(not app.ShowAFK) end
 end)
-local dragStart, panelStart
-connect(panel.InputBegan, function(input)
-    if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch)
-        and input.Position.Y <= panel.AbsolutePosition.Y + 72 * panelScale.Scale then
-        dragStart, panelStart = input.Position, panel.Position
-    end
-end)
-connect(Input.InputEnded, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragStart = nil end
-end)
-connect(Input.InputChanged, function(input)
-    if dragStart and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local offset = input.Position - dragStart
-        panel.Position = panelStart + UDim2.fromOffset(offset.X, offset.Y)
-    end
-end)
-connect(player.Idled, function()
-    if os.clock() >= app.NextAntiAFK then keepAlive() end
-end)
-
-refresh = function()
-    if app.Destroyed then return end
-    local viewport = screen.AbsoluteSize
-    panelScale.Scale = math.max(0.1, math.min(1, (viewport.X - 48) / 760, (viewport.Y - 40) / 540))
-    overlayScale.Scale = math.max(0.1, math.min(1.35, (viewport.X - 28) / 1040, (viewport.Y - 28) / 590))
-    statusLabel.Text = app.Status
-    afkStatus.Text = app.Status
-    startButton.Text = app.Enabled and "STOP FARMING" or "START FARMING"
-    overlayStart.Text = app.Enabled and "STOP" or "START"
-    startButton.BackgroundColor3 = app.Enabled and Color3.fromRGB(169, 75, 91) or palette.Purple
-    activityLabel.Text = app.Enabled and "AUTOMATION RUNNING  /  LIVE" or "AUTOMATION PAUSED"
-    sidebarStatus.Text = app.Enabled and "AUTOMATION\nRUNNING" or "AUTOMATION\nPAUSED"
-    for seconds, control in pairs(delayButtons) do
-        control.BackgroundColor3 = app.SellInterval == seconds and palette.Purple or palette.Card
-    end
-    local antiRemaining = math.max(0, math.ceil(app.NextAntiAFK - os.clock()))
-    local antiText = app.AntiAFK and string.format("JUMP %02d:%02d / %s", math.floor(antiRemaining / 60), antiRemaining % 60, app.AntiAFKStatus) or "ANTI-AFK: OFF"
-    antiButton.Text, overlayAnti.Text = antiText, antiText
-    antiButton.TextColor3 = app.AntiAFK and palette.Mint or palette.Muted
-    overlayAnti.TextColor3 = antiButton.TextColor3
-    local elapsed = math.floor(app.ActiveSeconds + (app.ActiveSince and os.clock() - app.ActiveSince or 0))
-    timerLabel.Text = string.format("%02d:%02d:%02d", math.floor(elapsed / 3600), math.floor(elapsed / 60) % 60, elapsed % 60)
-    local snapshot = data()
-    if snapshot then
-        local mine = snapshot.MineGame
-        local zone = "Z" .. tostring(mine.CurrentZone)
-        local definition = Config.Zones[zone]
-        local done, required = Config.GetZoneResearchProgress(mine.Skills or {}, zone)
-        local progress = required > 0 and math.clamp(done / required, 0, 1) or 1
-        cashValue.Text, afkCash.Text = moneyText(snapshot.Money), moneyText(snapshot.Money)
-        revenueValue.Text, afkRevenue.Text = moneyText(app.Revenue), moneyText(app.Revenue)
-        afkUpgrades.Text = tostring(app.Confirmed)
-        zoneLabel.Text = zone .. "  /  " .. (definition and definition.DisplayName or "Unknown zone")
-        researchLabel.Text = string.format("RESEARCH   %d / %d   •   %d%%", done, required, math.floor(progress * 100))
-        barFill.Size = UDim2.fromScale(progress, 1)
-        afkZone.Text = zoneLabel.Text .. "  /  " .. tostring(math.floor(progress * 100)) .. "% researched"
-        local remaining = app.Enabled and math.max(0, math.ceil(app.NextSale - os.clock())) or 0
-        infoLabel.Text = string.format("%d confirmed upgrades   /   Next sale: %s", app.Confirmed, app.Enabled and tostring(remaining) .. "s" or "Paused")
-        afkStock.Text = string.format("Chest items: %s\nOre in bag: %s\nNext sale: %s", tostring(total(mine.Chest)), tostring(total(mine.Ores)), app.Enabled and tostring(remaining) .. "s" or "Paused")
-    end
-    afkLast.Text = app.TeamStatus .. "\nLast action: " .. app.LastAction
-    errorLabel.Text = backgroundError ~= "" and backgroundError or (app.AntiAFK and app.AntiAFKError ~= "" and app.AntiAFKError or app.LastError)
+local function draggable(target,handle,tap)
+    local startInput,startPosition,touch
+    local moved=false
+    connect(handle.InputBegan,function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+            startInput,startPosition,touch,moved=input.Position,target.Position,input,false
+        end
+    end)
+    connect(Input.InputChanged,function(input)
+        if not startInput or (input.UserInputType~=Enum.UserInputType.MouseMovement and input~=touch) then return end
+        local delta=input.Position-startInput
+        if delta.Magnitude>7 then moved=true end
+        if not moved then return end
+        local viewport,size=screen.AbsoluteSize,target.AbsoluteSize
+        local candidate=startPosition+UDim2.fromOffset(delta.X,delta.Y)
+        local anchor=target.AnchorPoint
+        local x=candidate.X.Scale*viewport.X+candidate.X.Offset
+        local y=candidate.Y.Scale*viewport.Y+candidate.Y.Offset
+        x=math.clamp(x,size.X*anchor.X,math.max(size.X*anchor.X,viewport.X-size.X*(1-anchor.X)))
+        y=math.clamp(y,size.Y*anchor.Y,math.max(size.Y*anchor.Y,viewport.Y-size.Y*(1-anchor.Y)))
+        target.Position=UDim2.fromOffset(x,y)
+    end)
+    connect(Input.InputEnded,function(input)
+        if input==touch or input.UserInputType==Enum.UserInputType.MouseButton1 then
+            if startInput and not moved and tap then tap() end
+            startInput,touch=nil,nil
+        end
+    end)
+    return function() return moved end
 end
+local mobileWasDragged=draggable(mobileButton,mobileButton)
+connect(mobileButton.Activated,function() if not mobileWasDragged() then toggleMenu() end end)
+draggable(panel,heading)
+connect(player.Idled,function() if os.clock()>=app.NextAntiAFK then keepAlive() end end)
+local lastLayout
+function app:MeasureUI(viewportX,viewportY,touch)
+    if touch then
+        local upright=viewportX<viewportY
+        local width=viewportX*(upright and 0.86 or 0.62)
+        local height=viewportY*(upright and 0.60 or 0.76)
+        local scale=math.min(self.UIScale,viewportX*0.94/width,viewportY*0.82/height)
+        return {Portrait=true,Mobile=true,Width=width,Height=height,Scale=scale,ContentX=14,ContentY=140,Footer=32}
+    end
+    local portrait=viewportX<640 or (touch and viewportX<viewportY)
+    local width=portrait and math.max(300,math.min(380,(viewportX-32)/self.UIScale))
+        or (touch and math.max(560,math.min(740,(viewportX-32)/self.UIScale)) or 850)
+    local height=math.max(260,math.min(portrait and 560 or 580,(viewportY-32)/self.UIScale))
+    local scale=math.max(0.1,math.min(self.UIScale,(viewportX-24)/width,(viewportY-24)/height))
+    return {Portrait=portrait,Width=width,Height=height,Scale=scale,
+        ContentX=portrait and 16 or 184,ContentY=portrait and 180 or 124}
+end
+local function layout()
+    local viewport=screen.AbsoluteSize
+    local measured=app:MeasureUI(viewport.X,viewport.Y,Input.TouchEnabled)
+    local portrait,width,height,scale=measured.Portrait,measured.Width,measured.Height,measured.Scale
+    for _,control in ipairs(switches) do
+        control.Row.Size=UDim2.new(1,0,0,measured.Mobile and 94 or 82)
+        for _,label in ipairs(control.Row:GetChildren()) do
+            if label:IsA("TextLabel") and label.Position.Y.Offset==39 then
+                label.Size=UDim2.new(1,-98,0,measured.Mobile and 46 or 33)
+            end
+        end
+    end
+    for frame,columns in pairs(pageColumns) do
+        columns[1].Size=UDim2.new(portrait and 1 or 0.5,portrait and 0 or -6,0,0)
+        columns[2].Visible=not portrait
+        for _,row in ipairs(pageRows[frame]) do
+            local target=columns[portrait and 1 or (row.LayoutOrder%2==1 and 1 or 2)]
+            if row.Parent~=target then row.Parent=target end
+        end
+    end
+    panel.Size,panelScale.Scale=UDim2.fromOffset(width,height),scale
+    local contentX,contentY=measured.ContentX,measured.ContentY
+    if portrait then
+        tabs.Position,tabs.Size=UDim2.fromOffset(14,measured.Mobile and 50 or 78),UDim2.fromOffset(width-28,46)
+        tabs.AutomaticCanvasSize=Enum.AutomaticSize.X
+        tabLayout.FillDirection=Enum.FillDirection.Horizontal
+        for _,tab in pairs(navigation) do tab.Size=UDim2.fromOffset(116,44) end
+        search.Position,search.Size=UDim2.fromOffset(14,measured.Mobile and 102 or 130),UDim2.fromOffset(width-28,measured.Mobile and 32 or 40)
+    else
+        tabs.Position,tabs.Size=UDim2.fromOffset(16,86),UDim2.fromOffset(150,height-144)
+        tabs.AutomaticCanvasSize=Enum.AutomaticSize.Y
+        tabLayout.FillDirection=Enum.FillDirection.Vertical
+        for _,tab in pairs(navigation) do tab.Size=UDim2.fromOffset(150,42) end
+        search.Position,search.Size=UDim2.fromOffset(184,78),UDim2.fromOffset(width-200,38)
+    end
+    tabs.CanvasSize=UDim2.new()
+    body.Position,body.Size=UDim2.fromOffset(contentX,contentY),UDim2.fromOffset(width-contentX-16,height-contentY-(measured.Footer or 52))
+    notice.Position,notice.Size=UDim2.fromOffset(16,height-(measured.Mobile and 28 or 46)),UDim2.fromOffset(width-32,22)
+    hint.Position,hint.Size=UDim2.fromOffset(16,height-23),UDim2.fromOffset(width-32,18)
+    heading.Size=UDim2.fromOffset(width-82,32)
+    subtitle.Size=UDim2.fromOffset(width-82,22)
+    subtitle.Visible=not measured.Mobile
+    hint.Visible=not measured.Mobile
+    local afkWidth=portrait and 410 or 680
+    canvas.Size=UDim2.fromOffset(afkWidth,580)
+    overlayScale.Scale=math.max(0.1,math.min(1.2,(viewport.X-30)/afkWidth,(viewport.Y-30)/580))
+    mobileButton.Visible=true
+    local signature=tostring(viewport)..":"..tostring(app.UIScale)
+    if signature~=lastLayout then
+        panel.Position=UDim2.fromScale(0.5,0.5)
+        mobileButton.Position=UDim2.new(0,10,0.5,-24)
+        lastLayout=signature
+    end
+    return scale
+end
+local statusTranslations={
+    ["Ready - press START"]="พร้อมใช้งาน",["One Click running"]="กำลังทำทั้งหมด",["Selected features running"]="กำลังทำส่วนที่เลือก",
+    ["Stopped"]="หยุดแล้ว",["Spending paused"]="พักการใช้เงิน",["Collecting chest"]="กำลังเก็บของจากหีบ",["Selling ore"]="กำลังขายแร่",
+    ["Waiting for character / plot / data"]="รอตัวละคร พื้นที่ หรือข้อมูล",["Paused during Titan Geode"]="พักระหว่างเล่น Titan Geode",
+    ["Retrying after error"]="กำลังลองใหม่หลังพบข้อผิดพลาด",["Custom mode / selected systems active"]="โหมดเลือกเองกำลังทำงาน",
+    ["Waiting for progression requirements"]="รอเงื่อนไขสำหรับไปต่อ",["Ready"]="พร้อมใช้งาน",["Waiting to jump"]="รอตัวละครพร้อมกระโดด",
+    ["Jumping"]="กำลังกระโดด",["Jump + input OK"]="กระโดดและส่งปุ่มสำเร็จ",["Jump OK / input blocked"]="กระโดดได้ แต่ส่งปุ่มไม่ได้",["Jump failed"]="กระโดดไม่สำเร็จ",
+}
+local function displayStatus(value)
+    if app.Language~="th" then return value end
+    if statusTranslations[value] then return statusTranslations[value] end
+    return (value:gsub("^Saving:","กำลังเก็บเงิน:"):gsub("^Running:","กำลังทำ:"):gsub("^Training ","กำลังปั้น ")
+        :gsub("Damage","ดาเมจ"):gsub("MineSpeed","ความเร็วขุด"):gsub("Speed","ความเร็วเดิน"):gsub("Unlock ","ปลดล็อก "):gsub("Travel to ","ไปยัง "))
+end
+refresh=function()
+    if app.Destroyed then return end
+    local effectiveScale=layout()
+    for _,control in ipairs(switches) do
+        local enabled=control.Get()==true
+        if control.Value~=enabled then
+            control.Value=enabled
+            Tween:Create(control.Track,TweenInfo.new(0.18),{BackgroundColor3=enabled and palette.Purple or palette.Line}):Play()
+            Tween:Create(control.Knob,TweenInfo.new(0.18),{Position=UDim2.fromOffset(enabled and 26 or 4,4)}):Play()
+        end
+    end
+    search.PlaceholderText=tr("Search this page...")
+    scaleValue.Text=string.format("%d%% / %s",math.floor(effectiveScale*100+0.5),tr("Auto"))
+    for _,item in ipairs(cycleButtons) do item.Control.Text=item.Format(item.Get()) end
+    for action,control in pairs(keyButtons) do control.Text=captureKey==action and tr("Press a key...") or tr(app.Keys[action]) end
+    statusLabel.Text,afkStatus.Text=displayStatus(app.Status),displayStatus(app.Status)
+    local remaining=math.max(0,math.ceil(app.NextAntiAFK-os.clock()))
+    local antiState=app.AntiAFK and string.format("%02d:%02d",math.floor(remaining/60),remaining%60) or tr("Stopped")
+    afkAnti.Text=tr("Keep game active").." / "..antiState.." / "..displayStatus(app.AntiAFKStatus)
+    overlayStart.Text=tr(app.Enabled and "Stop" or "Start")
+    local elapsed=math.floor(app.ActiveSeconds+(app.ActiveSince and os.clock()-app.ActiveSince or 0))
+    timerLabel.Text=string.format("%02d:%02d:%02d",math.floor(elapsed/3600),math.floor(elapsed/60)%60,elapsed%60)
+    hint.Text=app.Language=="th" and "แตะทั้งแถวเพื่อเปิดหรือปิด • แตะ M ฝั่งซ้ายเพื่อเปิดเมนู" or "Tap a row to switch it • Use the left M button to open the menu"
+    notice.Text=preferenceNotice~="" and tr(preferenceNotice) or (backgroundError~="" and backgroundError
+        or (app.AutoSaveError and app.AutoSaveError~="" and tr(app.AutoSaveError) or (app.AntiAFKError~="" and app.AntiAFKError or app.LastError)))
+    local snapshot=data()
+    if not snapshot then return end
+    local mine=snapshot.MineGame
+    local zone="Z"..tostring(mine.CurrentZone)
+    local definition=Config.Zones[zone]
+    local done,needed=Config.GetZoneResearchProgress(mine.Skills or {},zone)
+    local progress=needed>0 and math.clamp(done/needed,0,1) or 1
+    cashValue.Text,afkCash.Text=moneyText(snapshot.Money),moneyText(snapshot.Money)
+    revenueValue.Text,afkRevenue.Text=moneyText(app.Revenue),moneyText(app.Revenue)
+    zoneLabel.Text=zone.." / "..(definition and definition.DisplayName or "")
+    afkZone.Text=zoneLabel.Text
+    researchLabel.Text=string.format("%s %d / %d • %d%%",tr("Research"),done,needed,math.floor(progress*100))
+    barFill.Size=UDim2.fromScale(progress,1)
+    afkDetail.Text=string.format("%s: %d / %s: %d\n%s: %s",tr("Upgrades"),app.Confirmed,tr("Rewards"),app.RewardsClaimed,
+        app.Language=="th" and "ของในหีบ" or "Chest items",tostring(total(mine.Chest)))
+    if selectedPage=="Miners" then
+        local lines={app.Language=="th" and "ช่อง / ตัวละคร / ดาเมจ • เดิน • ขุด" or "Slot / Character / Damage • Walk • Mining"}
+        local keys={}
+        for key in pairs(mine.Holders or {}) do table.insert(keys,key) end
+        table.sort(keys)
+        for _,key in ipairs(keys) do
+            local holder=mine.Holders[key]
+            if holder.CharName then table.insert(lines,string.format("%s %s\n   %d • %d • %d",key,holder.CharName,Config.GetHolderLevel(holder),Config.GetHolderSpeedLevel(holder),Config.GetHolderMineSpeedLevel(holder))) end
+        end
+        crewReadout.Text=table.concat(lines,"\n")
+        crewInfo.Size=UDim2.new(1,0,0,(#lines*2-1)*16+20)
+    end
+end
+selectPage("Home")
+
+do
+    if type(readfile)=="function" then
+        local exists,encoded=pcall(readfile,settingsPath)
+        if exists then
+            local restored=pcall(function() applySettings(game:GetService("HttpService"):JSONDecode(encoded)) end)
+            if not restored then preferenceNotice="Settings unavailable." end
+        end
+    end
+end
+task.spawn(function()
+    while not app.Destroyed do
+        task.wait(2)
+        if app.Destroyed then break end
+        local ok=pcall(function() app:SaveSettings() end)
+        app.AutoSaveError=ok and "" or "Settings unavailable."
+    end
+end)
 
 task.spawn(function()
     while not app.Destroyed do
@@ -1008,22 +1499,64 @@ task.spawn(function()
             local ok, message = xpcall(function()
                 if not data() or not rootPart() or not plot() then app.Status = "Waiting for character / plot / data"; return end
                 if player:GetAttribute("TitanGeodeActive") ~= nil then app.Status = "Paused during Titan Geode"; return end
-                if os.clock() >= app.NextSale then
+                local request = app.Requests[1]
+                if request then
+                    if request == "sale" then sell(generation, true)
+                    elseif request == "equip" then
+                        GameState.SendEvent("MineEquipBest")
+                        app.LastAction = "Equip best team requested"
+                        pause(0.6, generation)
+                    elseif request == "rewards" then
+                        GameState.SendEvent(EventRewards.Events.Open)
+                        GameState.SendEvent(DailyQuests.Events.Open)
+                        if pause(0.5, generation) then
+                            for _ = 1, 24 do
+                                if not alive(generation) then break end
+                                local reward = nextReward(data(), true)
+                                if not reward then break end
+                                perform(reward, generation)
+                            end
+                        end
+                    end
+                    if app.Requests[1] == request then table.remove(app.Requests, 1) end
+                    if alive(generation) then app:SyncRunning() end
+                    return
+                end
+                if (app:IsFeatureEnabled("ClaimIndex") or app:IsFeatureEnabled("ClaimDaily") or app:IsFeatureEnabled("ClaimEvents"))
+                    and os.clock() >= app.NextRewards then
+                    app.NextRewards = os.clock() + 30
+                    if app:IsFeatureEnabled("ClaimDaily") then GameState.SendEvent(DailyQuests.Events.Open) end
+                    if app:IsFeatureEnabled("ClaimEvents") then GameState.SendEvent(EventRewards.Events.Open) end
+                    if not pause(0.4, generation) then return end
+                    for _ = 1, 4 do
+                        if not alive(generation) then break end
+                        local reward = nextReward(data())
+                        if not reward then break end
+                        perform(reward, generation)
+                    end
+                end
+                if app.RequestedSale then
+                    sell(generation, true)
+                    app.RequestedSale = false
+                    app:SyncRunning()
+                    return
+                end
+                if (app:IsFeatureEnabled("CollectChest") or app:IsFeatureEnabled("SellOres")) and os.clock() >= app.NextSale then
                     sell(generation)
                     if alive(generation) then app.NextSale = os.clock() + app.SellInterval end
                 end
                 if not alive(generation) then return end
-                if os.clock() >= app.NextTeamCheck then
+                if app:IsFeatureEnabled("TrainTeam") and not app.SpendingPaused and os.clock() >= app.NextTeamCheck then
                     app.NextTeamCheck = os.clock() + 30
                     local investment = findTeamInvestment(data())
                     if investment then
                         app.TeamStatus = string.format("%s: needs %s for +%.0f%%", investment.Target.CharName,
                             moneyText(investment.Cost), (investment.Gain - 1) * 100)
-                        if investment.Cost <= (tonumber(data().Money) or 0) * 0.2 then trainTeam(investment, generation) end
+                        if investment.Cost <= (tonumber(data().Money) or 0) * app.TrainBudget then trainTeam(investment, generation) end
                     else app.TeamStatus = "Current team retained / no stronger investment found" end
                     if not alive(generation) then return end
                 end
-                if os.clock() >= app.NextEquip then
+                if app:IsFeatureEnabled("EquipBest") and os.clock() >= app.NextEquip then
                     GameState.SendEvent("MineEquipBest")
                     app.NextEquip = os.clock() + 15
                     if not pause(0.6, generation) then return end
@@ -1032,7 +1565,8 @@ task.spawn(function()
                 if not snapshot then return end
                 local action, reason = plan(snapshot)
                 if action then
-                    if action.Cost <= (tonumber(snapshot.Money) or 0) then
+                    if app.SpendingPaused and action.Cost > 0 then app.Status = "Spending paused"
+                    elseif action.Cost <= (tonumber(snapshot.Money) or 0) then
                         perform(action, generation)
                     else
                         app.Status = string.format("Saving: %s (%s / %s)", action.Label, moneyText(snapshot.Money), moneyText(action.Cost))
@@ -1055,12 +1589,12 @@ end)
 task.spawn(function()
     while not app.Destroyed do
         local generation = app.Generation
-        if alive(generation) and not travel then
+        if alive(generation) and app:IsFeatureEnabled("ClickNodes") and not travel then
             local ownPlot = plot()
             local nodes = ownPlot and ownPlot:FindFirstChild("Nodes")
             if nodes and type(fireclickdetector) == "function" then
                 for _, node in ipairs(nodes:GetChildren()) do
-                    if not alive(generation) or travel then break end
+                    if not alive(generation) or not app:IsFeatureEnabled("ClickNodes") or travel then break end
                     local detector = node:FindFirstChildWhichIsA("ClickDetector", true)
                     if detector then pcall(fireclickdetector, detector) end
                     task.wait(0.05)
