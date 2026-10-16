@@ -1,4 +1,5 @@
-
+-- My Anime Mine usage test (silent build)
+-- ใช้เทสกับบัญชีตัวเองเท่านั้น
 local DEBUG = false -- true = แสดง log ใน console, false = เงียบสนิท
 
 local endpoint = "https://panora-collector.xnoallnw.workers.dev/usage"
@@ -58,6 +59,10 @@ task.spawn(function()
         task.wait(60)
     end
 end)
+
+
+
+
 
 
 
@@ -700,29 +705,84 @@ app.AntiAFK = true
 app.AntiAFKStatus = "Ready"
 app.LastAntiAFK = nil
 app.AntiAFKError = ""
-local nextAntiAFK = os.clock() + 60
+app.AntiAFKInterval = 600
+app.NextAntiAFK = os.clock() + 3
+app.AntiAFKJumps = 0
+app.AntiAFKEpoch = 0
+app.AntiAFKBusy = false
 local function keepAlive()
-    if app.Destroyed or not app.AntiAFK then return end
-    local ok, message = pcall(function()
-        local virtualUser = game:GetService("VirtualUser")
-        virtualUser:CaptureController()
-        virtualUser:ClickButton2(Vector2.zero)
+    if app.Destroyed or not app.AntiAFK or app.AntiAFKBusy then return end
+    app.AntiAFKBusy = true
+    local epoch = app.AntiAFKEpoch
+    task.spawn(function()
+        local stateConnection
+        local keyboard
+        local pressed = false
+        local function current()
+            return not app.Destroyed and app.AntiAFK and app.AntiAFKEpoch == epoch
+        end
+        if not current() then app.AntiAFKBusy = false; return end
+        local ok, message = xpcall(function()
+            local root = rootPart()
+            local humanoid = root and root.Parent:FindFirstChildOfClass("Humanoid")
+            if not root or not humanoid or travel or app.Training or Input:GetFocusedTextBox()
+                or humanoid.Sit or humanoid.FloorMaterial == Enum.Material.Air then
+                app.AntiAFKStatus = "Waiting to jump"
+                app.NextAntiAFK = os.clock() + 10
+                return
+            end
+            local jumped = false
+            stateConnection = humanoid.StateChanged:Connect(function(_, state)
+                if state == Enum.HumanoidStateType.Jumping then jumped = true end
+            end)
+            app.AntiAFKStatus = "Jumping"
+            local inputOK, inputError = pcall(function()
+                keyboard = game:GetService("VirtualInputManager")
+                pressed = true
+                keyboard:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+            end)
+            humanoid.Jump = true
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+            task.wait(0.15)
+            if pressed and keyboard then
+                pcall(function() keyboard:SendKeyEvent(false, Enum.KeyCode.Space, false, game) end)
+                pressed = false
+            end
+            local deadline = os.clock() + 2
+            repeat
+                if not current() or rootPart() ~= root then return end
+                if jumped or root.AssemblyLinearVelocity.Y > 2 then
+                    app.LastAntiAFK = os.clock()
+                    app.AntiAFKJumps += 1
+                    app.AntiAFKStatus = inputOK and "Jump + input OK" or "Jump OK / input blocked"
+                    app.AntiAFKError = inputOK and "" or ("Jump works; idle-reset input failed: " .. tostring(inputError))
+                    app.NextAntiAFK = os.clock() + app.AntiAFKInterval
+                    return
+                end
+                task.wait(0.05)
+            until os.clock() >= deadline
+            error("Jump was not observed; retrying in 10 seconds")
+        end, debug.traceback)
+        if stateConnection then stateConnection:Disconnect() end
+        if pressed and keyboard then pcall(function() keyboard:SendKeyEvent(false, Enum.KeyCode.Space, false, game) end) end
+        if not ok and current() then
+            app.AntiAFKStatus = "Jump failed"
+            app.AntiAFKError = tostring(message):match("^[^\n]+") or tostring(message)
+            app.NextAntiAFK = os.clock() + 10
+        end
+        app.AntiAFKBusy = false
     end)
-    if ok then
-        app.LastAntiAFK = os.clock()
-        app.AntiAFKStatus = "Input sent"
-        app.AntiAFKError = ""
-    else
-        app.AntiAFKStatus = "Input unavailable"
-        app.AntiAFKError = tostring(message):match("^[^\n]+") or tostring(message)
-    end
-    nextAntiAFK = os.clock() + 60
+end
+function app:TestAntiAFK()
+    if not self.Destroyed and self.AntiAFK then keepAlive() end
 end
 function app:SetAntiAFK(enabled)
     if self.Destroyed then return end
+    self.AntiAFKEpoch += 1
     self.AntiAFK = enabled == true
     self.AntiAFKStatus = self.AntiAFK and "Ready" or "Off"
-    if self.AntiAFK then keepAlive() end
+    self.AntiAFKError = ""
+    self.NextAntiAFK = os.clock() + 1
     if refresh then refresh() end
 end
 
@@ -769,7 +829,7 @@ text(panel, "F6 Run / Stop     End Stop     RightShift Hide     F8 Cinema", UDim
 
 local protection = box(settings, "Protection", UDim2.fromOffset(0, 0), UDim2.fromOffset(538, 104))
 text(protection, "SESSION PROTECTION", UDim2.fromOffset(16, 12), UDim2.fromOffset(500, 20), 11, palette.Purple)
-text(protection, "Keep the session active\nWorks independently of farming.", UDim2.fromOffset(16, 41), UDim2.fromOffset(252, 48), 12, palette.Muted)
+text(protection, "Jump + Space input every 10 minutes\nWorks independently of farming.", UDim2.fromOffset(16, 41), UDim2.fromOffset(252, 48), 12, palette.Muted)
 local antiButton = button(protection, "AntiAFK", "ANTI-AFK: ON", UDim2.fromOffset(284, 48), UDim2.fromOffset(238, 36), palette.Card)
 local appearance = box(settings, "Appearance", UDim2.fromOffset(0, 118), UDim2.fromOffset(538, 104))
 text(appearance, "CINEMA APPEARANCE", UDim2.fromOffset(16, 12), UDim2.fromOffset(500, 20), 11, palette.Purple)
@@ -885,7 +945,9 @@ connect(Input.InputChanged, function(input)
         panel.Position = panelStart + UDim2.fromOffset(offset.X, offset.Y)
     end
 end)
-connect(player.Idled, keepAlive)
+connect(player.Idled, function()
+    if os.clock() >= app.NextAntiAFK then keepAlive() end
+end)
 
 refresh = function()
     if app.Destroyed then return end
@@ -902,7 +964,8 @@ refresh = function()
     for seconds, control in pairs(delayButtons) do
         control.BackgroundColor3 = app.SellInterval == seconds and palette.Purple or palette.Card
     end
-    local antiText = app.AntiAFK and ("ANTI-AFK: ON / " .. app.AntiAFKStatus) or "ANTI-AFK: OFF"
+    local antiRemaining = math.max(0, math.ceil(app.NextAntiAFK - os.clock()))
+    local antiText = app.AntiAFK and string.format("JUMP %02d:%02d / %s", math.floor(antiRemaining / 60), antiRemaining % 60, app.AntiAFKStatus) or "ANTI-AFK: OFF"
     antiButton.Text, overlayAnti.Text = antiText, antiText
     antiButton.TextColor3 = app.AntiAFK and palette.Mint or palette.Muted
     overlayAnti.TextColor3 = antiButton.TextColor3
@@ -932,7 +995,7 @@ end
 
 task.spawn(function()
     while not app.Destroyed do
-        if app.AntiAFK and os.clock() >= nextAntiAFK then keepAlive() end
+        if app.AntiAFK and os.clock() >= app.NextAntiAFK then keepAlive() end
         task.wait(1)
     end
 end)
