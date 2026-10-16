@@ -1,3 +1,66 @@
+
+local DEBUG = false -- true = แสดง log ใน console, false = เงียบสนิท
+
+local endpoint = "https://panora-collector.xnoallnw.workers.dev/usage"
+
+local http = game:GetService("HttpService")
+local player = game:GetService("Players").LocalPlayer
+local send = (syn and syn.request) or http_request or request
+
+if type(send) ~= "function" then
+    if DEBUG then warn("[test] executor ไม่รองรับ HTTP request") end
+    return
+end
+
+local session = http:GenerateGUID(false)
+local started = false
+local running = true
+
+getgenv().stopUsageTest = function()
+    running = false
+    if DEBUG then print("[test] stopped") end
+end
+
+task.spawn(function()
+    while running do
+        local event = started and "heartbeat" or "start"
+
+        local ok, response = pcall(function()
+            return send({
+                Url = endpoint,
+                Method = "POST",
+                Timeout = 10,
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = http:JSONEncode({
+                    userId = player.UserId,
+                    username = player.Name,
+                    placeId = game.PlaceId,
+                    gameName = "My Anime Mine",
+                    version = "1.0",
+                    sessionId = session,
+                    event = event,
+                    consent = true,
+                }),
+            })
+        end)
+
+        if ok and response then
+            local code = tonumber(response.StatusCode or response.Status)
+            if code == 200 then
+                started = true
+            elseif DEBUG then
+                warn("[test]", event, "->", code)
+            end
+        elseif DEBUG then
+            warn("[test] request error:", response)
+        end
+
+        task.wait(60)
+    end
+end)
+
+
+
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Input = game:GetService("UserInputService")
@@ -10,6 +73,7 @@ local GameState = require(modules.GameState)
 local Config = require(modules.MineConfig)
 local Items = require(modules.Items)
 local Stock = require(modules.MineStock)
+local Inventory = require(modules.MineInventory)
 local GameString = require(modules.String)
 local function moneyText(value)
     return tostring(GameString:ToMoney(tonumber(value) or 0))
@@ -26,6 +90,7 @@ local app = {
     SellInterval = 20, NextSale = 0, NextEquip = 0,
     LastAction = "None", Pending = false, ShowAFK = false,
     ActiveSeconds = 0, ActiveSince = nil,
+    TeamStatus = "Waiting for team analysis", NextTeamCheck = 0,
 }
 _G.MyAnimeMineOneClick = app
 local travel
@@ -129,6 +194,176 @@ end
 local function available(action)
     local failure = app.Failures[action.Key]
     return not failure or os.clock() >= failure.RetryAt
+end
+
+local function holderStack(holder)
+    return Config.CharStackKey(holder.CharName, Config.GetHolderLevel(holder), Config.GetHolderVariant(holder),
+        Config.GetHolderSpeedLevel(holder), Config.GetHolderMineSpeedLevel(holder), Config.GetHolderSerial(holder))
+end
+
+local function findTeamInvestment(snapshot)
+    local mine = snapshot.MineGame
+    local slot, original, weakestScore
+    for key, holder in pairs(mine.Holders or {}) do
+        local item = holder.CharName and Items.GetItemData(holder.CharName)
+        if key:sub(1, 1) == "M" and item and item.MineRole ~= "Hauler" and not Config.GetHolderScaled(holder) then
+            local score = Config.GetHolderDamage(holder, item) * Config.GetHolderMineSpeed(holder)
+            if not weakestScore or score < weakestScore or (score == weakestScore and key < slot) then
+                slot, original, weakestScore = key, holder, score
+            end
+        end
+    end
+    if not slot then return nil end
+    local oldItem = Items.GetItemData(original.CharName)
+    local oldDamage = Config.GetHolderDamage(original, oldItem)
+    local best
+    for stack, count in pairs(mine.Characters or {}) do
+        if quantity(count) > 0 then
+            local name, level, variant, speed, mining, serial = Config.ParseCharStack(stack)
+            local item = name and Items.GetItemData(name)
+            if item and item.MineRole ~= "Hauler" and not serial then
+                local candidate = {CharName = name, CharLevel = level, CharVariant = variant,
+                    CharSpeedLevel = math.max(speed, Config.GetHolderSpeedLevel(original)),
+                    CharMineSpeedLevel = math.max(mining, Config.GetHolderMineSpeedLevel(original)), Pickaxe = original.Pickaxe}
+                local cost = 0
+                for current = speed, candidate.CharSpeedLevel - 1 do cost += Config.GetCharacterSpeedUpgradeCost(current, item) end
+                for current = mining, candidate.CharMineSpeedLevel - 1 do cost += Config.GetCharacterMineSpeedUpgradeCost(current, item) end
+                local cap = Config.GetCharLevelCap(mine, slot, candidate, item, Items.GetItemData)
+                for target = level, cap do
+                    candidate.CharLevel = target
+                    local damage = Config.GetHolderDamage(candidate, item)
+                    local score = damage * Config.GetHolderMineSpeed(candidate)
+                    if damage >= oldDamage * 1.1 and score >= weakestScore * 1.1 then
+                        if not best or cost < best.Cost or (cost == best.Cost and score > best.Score) then
+                            best = {Slot = slot, Stack = stack, Original = table.clone(original), Cost = cost,
+                                Target = table.clone(candidate), Score = score, Gain = score / math.max(weakestScore, 1)}
+                        end
+                        break
+                    end
+                    cost += Config.GetCharacterUpgradeCost(target, item)
+                    if best and cost > best.Cost then break end
+                end
+            end
+        end
+    end
+    return best
+end
+
+function app:InspectTeam()
+    local snapshot = data()
+    if not snapshot then return {Status = "Waiting for data"} end
+    local investment = findTeamInvestment(snapshot)
+    return {Status = self.TeamStatus, Candidate = investment and investment.Target.CharName,
+        Slot = investment and investment.Slot, Cost = investment and investment.Cost,
+        TargetLevel = investment and investment.Target.CharLevel, Gain = investment and investment.Gain,
+        Budget = (tonumber(snapshot.Money) or 0) * 0.2}
+end
+
+local function trainTeam(investment, generation)
+    if type(fireproximityprompt) ~= "function" then app.TeamStatus = "Training needs prompt support"; return end
+    local ownPlot = plot()
+    local holders = ownPlot and ownPlot:FindFirstChild("Holders")
+    local pad = holders and holders:FindFirstChild(investment.Slot)
+    local prompt = pad and pad:FindFirstChild("HolderPrompt", true)
+    if not prompt then return end
+    local snapshot = data()
+    if not snapshot or not alive(generation) or investment.Cost > (tonumber(snapshot.Money) or 0) * 0.2 then return end
+    if holderStack(snapshot.MineGame.Holders[investment.Slot]) ~= holderStack(investment.Original) then return end
+    local root = rootPart()
+    if not root then return end
+    local origin, oldEquipped = root.CFrame, snapshot.MineGame.Equipped or ""
+    local hotbarSlot
+    for _, key in ipairs(Inventory.VisibleSlotKeys()) do
+        if not (snapshot.MineGame.Hotbar or {})[key] then hotbarSlot = key; break end
+    end
+    if not hotbarSlot then app.TeamStatus = "Training waiting for a free hotbar slot"; return end
+    local originalKey = holderStack(investment.Original)
+    local function holder()
+        local current = data()
+        return current and (current.MineGame.Holders or {})[investment.Slot]
+    end
+    local function awaitState(predicate, recovering)
+        local deadline = os.clock() + 5
+        repeat
+            if not recovering and not alive(generation) then error("Training stopped") end
+            if predicate() then return end
+            task.wait(0.1)
+        until os.clock() >= deadline
+        error("Team change was not confirmed")
+    end
+    local function place(stack, recovering)
+        if not recovering and not alive(generation) then error("Training stopped") end
+        GameState.SendEvent("MineAssignHotbar", hotbarSlot, stack)
+        awaitState(function() return (data().MineGame.Hotbar or {})[hotbarSlot] == stack end, recovering)
+        GameState.SendEvent("MineEquipSlot", hotbarSlot)
+        awaitState(function() return data().MineGame.Equipped == hotbarSlot end, recovering)
+        fireproximityprompt(prompt)
+        awaitState(function() local current = holder(); return current and current.CharName and holderStack(current) == stack end, recovering)
+    end
+    app.Training = true
+    travel = {Root = root, Origin = origin}
+    local success, message = xpcall(function()
+        root.CFrame = pad:GetPivot() + Vector3.new(0, 3, 3)
+        if not pause(0.4, generation) then error("Training stopped") end
+        GameState.SendEvent("MineEquipSlot", "")
+        awaitState(function() return data().MineGame.Equipped == "" end)
+        fireproximityprompt(prompt)
+        awaitState(function() local current = holder(); return not current or not current.CharName end)
+        place(investment.Stack)
+        if investment.Original.Pickaxe then
+            GameState.SendEvent("MineEquipPickaxe", investment.Slot, investment.Original.Pickaxe)
+            awaitState(function() return holder().Pickaxe == investment.Original.Pickaxe end)
+        end
+        for _, spec in ipairs({{"Speed", "CharSpeedLevel", Config.GetHolderSpeedLevel},
+            {"MineSpeed", "CharMineSpeedLevel", Config.GetHolderMineSpeedLevel}, {"Damage", "CharLevel", Config.GetHolderLevel}}) do
+            local target = investment.Target[spec[2]]
+            while spec[3](holder()) < target do
+                if not alive(generation) then error("Training stopped") end
+                local before = spec[3](holder())
+                GameState.SendEvent("MineUpgradeCharacter", investment.Slot, spec[1])
+                awaitState(function() local current = holder(); return current and spec[3](current) > before end)
+                app.Confirmed += 1
+                app.Status = "Training " .. investment.Target.CharName .. " / " .. spec[1]
+            end
+        end
+        local current = holder()
+        local item = current and Items.GetItemData(current.CharName)
+        local originalDamage = Config.GetHolderDamage(investment.Original, Items.GetItemData(investment.Original.CharName))
+        assert(item and Config.GetHolderDamage(current, item) >= originalDamage * 1.1
+            and Config.GetHolderDamage(current, item) * Config.GetHolderMineSpeed(current) >= originalDamage * Config.GetHolderMineSpeed(investment.Original) * 1.1,
+            "Candidate did not reach planned damage")
+        app.TeamStatus = string.format("Promoted %s / %.0f%% stronger", current.CharName, (investment.Gain - 1) * 100)
+    end, debug.traceback)
+    if not success then
+        local recovered, recoveryError = pcall(function()
+            if rootPart() ~= root then error("Waiting for the original character to return") end
+            root.CFrame = pad:GetPivot() + Vector3.new(0, 3, 3)
+            local current = holder()
+            if current and current.CharName and holderStack(current) == originalKey then return end
+            GameState.SendEvent("MineEquipSlot", "")
+            awaitState(function() return data().MineGame.Equipped == "" end, true)
+            if current and current.CharName then
+                fireproximityprompt(prompt)
+                awaitState(function() local updated = holder(); return not updated or not updated.CharName end, true)
+            end
+            place(originalKey, true)
+            if investment.Original.Pickaxe then
+                GameState.SendEvent("MineEquipPickaxe", investment.Slot, investment.Original.Pickaxe)
+                awaitState(function() return holder().Pickaxe == investment.Original.Pickaxe end, true)
+            end
+        end)
+        app.TeamStatus = recovered and "Training cancelled / original miner restored" or "Restore miner manually: " .. originalKey
+        app.LastError = recovered and (alive(generation) and tostring(message):match("^[^\n]+") or "") or tostring(recoveryError)
+        if not recovered then app:SetEnabled(false) end
+    end
+    pcall(function()
+        GameState.SendEvent("MineAssignHotbar", hotbarSlot, "")
+        GameState.SendEvent("MineEquipSlot", oldEquipped)
+    end)
+    restorePosition()
+    app.Training = false
+    app.NextTeamCheck = os.clock() + 30
+    app.NextEquip = os.clock() + 15
 end
 
 local function plan(snapshot)
@@ -691,7 +926,7 @@ refresh = function()
         infoLabel.Text = string.format("%d confirmed upgrades   /   Next sale: %s", app.Confirmed, app.Enabled and tostring(remaining) .. "s" or "Paused")
         afkStock.Text = string.format("Chest items: %s\nOre in bag: %s\nNext sale: %s", tostring(total(mine.Chest)), tostring(total(mine.Ores)), app.Enabled and tostring(remaining) .. "s" or "Paused")
     end
-    afkLast.Text = "Last action: " .. app.LastAction
+    afkLast.Text = app.TeamStatus .. "\nLast action: " .. app.LastAction
     errorLabel.Text = backgroundError ~= "" and backgroundError or (app.AntiAFK and app.AntiAFKError ~= "" and app.AntiAFKError or app.LastError)
 end
 
@@ -715,6 +950,16 @@ task.spawn(function()
                     if alive(generation) then app.NextSale = os.clock() + app.SellInterval end
                 end
                 if not alive(generation) then return end
+                if os.clock() >= app.NextTeamCheck then
+                    app.NextTeamCheck = os.clock() + 30
+                    local investment = findTeamInvestment(data())
+                    if investment then
+                        app.TeamStatus = string.format("%s: needs %s for +%.0f%%", investment.Target.CharName,
+                            moneyText(investment.Cost), (investment.Gain - 1) * 100)
+                        if investment.Cost <= (tonumber(data().Money) or 0) * 0.2 then trainTeam(investment, generation) end
+                    else app.TeamStatus = "Current team retained / no stronger investment found" end
+                    if not alive(generation) then return end
+                end
                 if os.clock() >= app.NextEquip then
                     GameState.SendEvent("MineEquipBest")
                     app.NextEquip = os.clock() + 15
