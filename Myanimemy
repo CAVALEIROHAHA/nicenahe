@@ -1,4 +1,4 @@
--- AutofarmPlus: based on paneer's supplied second file.
+-- ควยไอพวกมาเสือก
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Input = game:GetService("UserInputService")
